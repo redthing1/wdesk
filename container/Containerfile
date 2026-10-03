@@ -1,0 +1,12 @@
+FROM rust:1.97-bookworm AS build
+WORKDIR /src
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+COPY assets ./assets
+COPY guest ./guest
+RUN cargo build --locked --release
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends qemu-system-x86 qemu-utils ca-certificates && rm -rf /var/lib/apt/lists/*
+COPY --from=build /src/target/release/wdesk /usr/local/bin/wdesk
+ENTRYPOINT ["/usr/local/bin/wdesk"]

@@ -1,0 +1,10 @@
+/target/
+/.artifacts/
+# Private working memory and local control artifacts; never publish.
+/notes/
+/windows-client.json
+/desktop.png
+*.iso
+*.qcow2
+*.partial
+!AGENTS.md

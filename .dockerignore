@@ -1,0 +1,10 @@
+.git
+target
+notes
+tests
+.artifacts
+*.iso
+*.qcow2
+*.partial
+windows-client.json
+desktop.png
