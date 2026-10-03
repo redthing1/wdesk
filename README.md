@@ -1,11 +1,12 @@
 # wdesk
 
 An agent-friendly Windows guest toolkit for Linux/KVM. One Rust CLI provides
-native screenshots, input, guest processes and files, desktop context, and a
+native screenshots, input, Windows processes and files, desktop context, and a
 shared browser view. Optional Docker/Podman packaging uses the same QEMU runtime.
 
-Install once, seal a base, and boot disposable overlays. The guest helper uses
-inbox PowerShell and .NET; no guest Python, browser driver, or network service.
+Prepare once. Seal a known-good environment. Run experiments in independent
+copy-on-write disks, then reset them to the baseline. No guest Python, browser
+driver, or network service; the helper uses inbox PowerShell and .NET.
 
 ## Start
 
@@ -16,19 +17,19 @@ Requires x86-64 Linux, accessible `/dev/kvm`, Rust 1.90+, QEMU with PNG capture,
 sudo apt-get install qemu-system-x86 qemu-utils xorriso mtools
 cargo install --locked --path .
 wdesk doctor
-wdesk image install --iso /path/to/windows.iso --name windows-lite --compress
+wdesk image install --media tiny11-25h2 --name windows-lite --compress
 wdesk open
 wdesk view --browser
 ```
 
-Windows 11 Pro, Tiny11, and Tiny11 Core are supported through optional
-`reference`, `lite`, and `core` profiles. `wdesk image media` lists pinned Tiny11
-presets; downloads are explicit and SHA-256 verified. See
-[images and footprint](doc/images.md) for media, compression, and setup details.
+This example explicitly downloads a pinned, SHA-256-verified Tiny11 preset.
+For your own Windows 11 Pro media, replace `--media tiny11-25h2` with
+`--iso /path/to/windows.iso`. See [images](doc/images.md) for profiles,
+third-party media caveats, and footprint.
 
-Defaults: two CPUs, 4 GiB RAM, sparse 64 GiB disk. Both pinned 25H2 variants pass
-acceptance at two CPUs and 2 GiB RAM on native KVM, Docker, and rootless Podman.
-Your applications may need more.
+Defaults: two CPUs, 4 GiB RAM, sparse 64 GiB disk. Regular Tiny11 and Core 25H2
+pass acceptance at two CPUs and 2 GiB RAM on native KVM, Docker, and rootless
+Podman. Applications may need more.
 
 ## Use
 
@@ -47,54 +48,52 @@ wdesk process wait PROCESS_ID --timeout 30
 wdesk export downloads/result.json ./result.json
 ```
 
-Use `--json` for machine output. Coordinates are native pixels; actions report
-delivery, not application success. `click`, `type`, and `key` accept
-`--generation N` to reject stale input. Guest execution stays in Windows;
-remote files are scoped to `workspace/` and `downloads/`. See
-[protocol](doc/protocol.md) and [agent instructions](skills/wdesk/SKILL.md).
+Use `--json` for machine output. Coordinates are native pixels; delivery does
+not prove application success. `click`, `type`, and `key` accept `--generation N`
+to reject stale input. Guest execution stays in Windows; files are scoped to
+`workspace/` and `downloads/`. See [agent instructions](skills/wdesk/SKILL.md)
+and [protocol](doc/protocol.md).
 
-## Manage
+## Experiment
+
+[Prepare a baseline](doc/images.md#prepared-environments) with your tools, then
+use a new session name for each experiment:
 
 ```sh
-wdesk --session scratch open --image windows-lite --offline
-wdesk --session scratch stop
-wdesk --session scratch open
-wdesk --session scratch reset
-wdesk --session scratch delete
-wdesk image build --engine podman
-wdesk --session boxed open --image windows-lite --engine podman
+wdesk --session exp-a open --image lab-v1 --memory 2048 --cpus 2 --offline
+wdesk --session exp-a stop
+wdesk --session exp-a open
+wdesk --session exp-a reset
+wdesk --session exp-a delete
 ```
 
-`open` resumes recorded settings. `stop` keeps writes; `reset` starts a fresh
-overlay. Export results first. Reset retains its old disk, and deletion moves
-files to recovery trash; remove those copies separately to reclaim space.
+`open` resumes recorded settings. `stop` keeps writes; `reset` cold-boots the
+baseline. Export results first. Reset retains its old disk; deletion moves files
+to recovery trash. Remove those copies separately to reclaim space.
 
-State lives under `$XDG_DATA_HOME/wdesk` or `~/.local/share/wdesk`, overridable
-with `WDESK_HOME`. Keep it private and outside Git. Never move a base with
-dependent instances. The OCI runner packages Linux tooling, not native Windows
-containers. Use `--engine docker` for Docker and `image build --source PATH`
-when outside the checkout.
+State defaults to `$XDG_DATA_HOME/wdesk` or `~/.local/share/wdesk`; override with
+`WDESK_HOME`. Keep it private and outside Git. Do not move or remove a base
+while dependent sessions exist.
 
-## Share
+## Containers and sharing
 
 ```sh
-wdesk connect ./windows-client.json
+wdesk image build --engine podman
+wdesk --session boxed open --image lab-v1 --engine podman
+wdesk --session boxed connect ./windows-client.json
 WDESK_DESCRIPTOR=./windows-client.json wdesk --json capabilities
 ```
 
-Descriptors grant desktop access without lifecycle or viewer credentials.
-Keep them private. `view` provides a separate browser credential; browser and
-agent input share one queue. APIs bind to loopback; raw VM control ports are not
-published. Offline mode retains private helper control.
+Use `--engine docker` for Docker and `image build --source PATH` outside the
+checkout. OCI packages Linux tooling, not native Windows containers. The API
+is published on loopback; raw VM control ports are not exposed. Offline mode
+retains private helper control.
+
+Keep descriptors private: they grant desktop access, not lifecycle or viewer
+credentials. `view` supplies a separate browser credential. Browser and agent
+input share one queue.
 
 ## Develop
 
-```sh
-cargo fmt --check
-cargo test --locked
-cargo clippy --locked --all-targets -- -D warnings
-bash tests/repository-check.sh
-```
-
-See [architecture](doc/architecture.md) and [testing](doc/testing.md).
-Private notes and generated artifacts are excluded from Git and packaging.
+See [testing](doc/testing.md) for checks and [architecture](doc/architecture.md)
+for internals. Private notes and generated artifacts stay out of Git and packaging.

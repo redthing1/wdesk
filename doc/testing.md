@@ -1,6 +1,6 @@
 # Testing
 
-## Source checks
+## Source
 
 ```sh
 cargo fmt --check
@@ -10,14 +10,14 @@ bash tests/repository-check.sh
 cargo build --locked
 ```
 
-CI runs Rust, syntax, and repository checks, not Windows acceptance.
-Repository checks also need Git, ripgrep, and Node.js; no npm packages.
+CI runs Rust, syntax, and repository checks—not Windows acceptance.
+Repository checks also require Git, ripgrep, and Node.js; no npm packages.
 
-## Runtime acceptance
+## Runtime
 
-Requires QEMU/KVM, `jq`, and `curl`; Windows tests need a prepared image.
-Build the OCI runner before engine tests with `wdesk image build --engine ENGINE`.
-Run from the checkout or pass `--source PATH`.
+Requires QEMU/KVM, `jq`, and `curl`. Windows tests need a prepared image.
+Build the runner for each OCI engine with `wdesk image build --engine ENGINE`
+from the checkout, or pass `--source PATH`.
 
 ```sh
 bash tests/qemu-smoke.sh
@@ -27,16 +27,17 @@ WDESK_TEST_IMAGE=windows-lite bash tests/windows-e2e.sh docker
 WDESK_TEST_IMAGE=windows-lite bash tests/isolation.sh podman
 ```
 
-QEMU smoke covers capture, authentication, retries, stale input, reset, and
-unlinked-executable startup. Windows acceptance adds real helper transport,
-Unicode input/clipboard, files, bounded processes, x86 compatibility, focus,
-UIA, reboot, and reset isolation. Isolation checks two guests' files, clipboard,
-and credentials. Linux mocks do not prove Windows behavior.
+QEMU smoke checks capture, auth, retries, stale input, reset, and unlinked-binary
+startup. Windows acceptance adds real helper transport, Unicode input/clipboard,
+files, bounded processes, x86 compatibility, focus, UIA, reboot, and reset.
+Isolation checks two guests' files, clipboard, and credentials.
+Linux mocks do not prove Windows behavior.
 
-Tests create new sessions, stop VMs on exit, and retain diagnostics. Successful
-deletion retains disks in recovery trash. Override `WDESK_BIN`, `WDESK_TEST_IMAGE`,
-`WDESK_TEST_MEMORY` (MiB), or `WDESK_TEST_CPUS`. Use `WDESK_TEST_VERSION` to check
-the Windows version and `WDESK_TEST_COMPACT=1` to require CompactOS.
+Tests use new sessions, stop VMs on exit, and retain diagnostics. Deleted sessions
+still occupy recovery trash. Defaults: `target/debug/wdesk`, image `windows-lite`,
+two CPUs, 4 GiB RAM. Override `WDESK_BIN`, `WDESK_TEST_IMAGE`, `WDESK_TEST_MEMORY`
+(MiB), or `WDESK_TEST_CPUS`. `WDESK_TEST_VERSION` checks Windows version;
+`WDESK_TEST_COMPACT=1` requires CompactOS.
 
 ## Browser
 
@@ -48,6 +49,6 @@ npm install --prefix /path/to/browser-tests playwright
 NODE_PATH=/path/to/browser-tests/node_modules node tests/viewer-smoke.cjs
 ```
 
-Chromium also needs its host system libraries. Use an open default session or
-set `WDESK_SESSION`. The test checks native canvas geometry and Unicode readback
-through the shared input queue using an inbox WinForms fixture.
+Chromium needs its host system libraries. Use an open default session or set
+`WDESK_SESSION`. The test checks native geometry and Unicode readback through
+the shared input queue using an inbox WinForms fixture.
