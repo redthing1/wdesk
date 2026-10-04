@@ -9,20 +9,23 @@ trusted host CLI ─── native process or Podman/Docker owner
 agent CLI ── authenticated API ── per-VM Rust runtime ── QEMU/KVM
 browser ── viewer credential ────┤                         │
                                 ├─ private QMP: pixels/input
-                                └─ private guestfwd/serial: Windows helper
-                                                        ├─ Win32 windows/input
-                                                        ├─ Job Object processes
-                                                        ├─ scoped NTFS files
-                                                        └─ bounded UIA worker
+                                ├─ private guestfwd/serial: console helper
+                                └─ private guestfwd: binary file worker
 ```
 
 ## Runtime
 
 The builder creates a seed CD and FAT answer-file disk. IDE storage, VGA, USB
 tablet, and COM1 use inbox drivers. QMP and helper sockets stay private to the
-runtime. The helper connects outward through one guestfwd rule; offline mode
+runtime. The helper connects outward through private guestfwd channels; offline mode
 blocks external routing without losing control. Serial is the recovery path.
 No inbound guest ports are forwarded.
+
+Optional live shares use a per-VM unprivileged Samba child. A private Unix socket
+and per-connection guestfwd relay preserve SMB connection lifetimes; no host SMB
+port is published by OCI. Only owner configuration grants host directories.
+The runtime attaches them through a private helper operation excluded from the
+agent protocol. See [shares](shares.md).
 
 Readiness progresses through `vm_running`, `guest_responding`, `helper_ready`,
 and `automation_ready` after native capture. Elevated first-logon provisioning
@@ -47,7 +50,11 @@ result; changed bodies are rejected. See [protocol](protocol.md).
 One STA helper loop dispatches requests; ids distinguish late replies.
 Owned processes use Windows argv quoting, suspended creation, Job Object assignment,
 then resume. Output keeps draining after its retention bound. UIA uses an owned
-worker with an eight-second timeout. Chunked files verify SHA-256 before committing.
+worker with an eight-second timeout. Process handles retire independently; at most
+128 completion receipts survive for ten minutes. Closing an owned parent also
+ends its job's descendants. A separate bounded file worker streams binary
+ranges and hashes off the STA thread. Uploads verify SHA-256, then atomically
+rename within NTFS using a verified parent handle. Transfers never require a mount.
 
 Guest execution never runs on Linux. File scoping rejects traversal, device
 names, drive syntax, and reparse components, and verifies opened handles against

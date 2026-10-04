@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
 cd "$(dirname "$0")/.."
 bin="${WDESK_BIN:-$PWD/target/debug/wdesk}"
 image="${WDESK_TEST_IMAGE:-windows-lite}"

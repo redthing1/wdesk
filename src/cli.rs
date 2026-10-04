@@ -1,8 +1,9 @@
 use crate::{
     client::Client,
-    lifecycle, media,
+    graphics, lifecycle, media,
     protocol::Action,
     state::{self, VmConfig},
+    storage,
 };
 use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand};
@@ -61,6 +62,24 @@ enum Command {
     },
     /// Stop this session and move its files to private recovery trash
     Delete,
+    /// Report owned storage and exact recovery cleanup targets
+    Storage,
+    /// Preview removal of one recovery target; --execute permanently removes it
+    Prune {
+        target: String,
+        #[arg(long)]
+        execute: bool,
+    },
+    /// Owner-only live host directory grants; change while the VM is stopped
+    Share {
+        #[command(subcommand)]
+        command: Share,
+    },
+    #[command(hide = true)]
+    ShareRelay {
+        #[arg(long)]
+        socket: PathBuf,
+    },
     /// Print the shared interactive browser URL
     View {
         #[arg(long)]
@@ -138,13 +157,26 @@ enum Command {
         #[command(subcommand)]
         command: Process,
     },
+    /// Optional application-local software graphics
+    Graphics {
+        #[command(subcommand)]
+        command: Graphics,
+    },
     Import {
         local: PathBuf,
         remote: String,
+        /// Resume an interrupted upload in the same helper incarnation
+        #[arg(long)]
+        resume: Option<String>,
     },
     Export {
         remote: String,
         local: PathBuf,
+    },
+    /// Inspect or cancel a streaming transfer
+    Transfer {
+        #[command(subcommand)]
+        command: Transfer,
     },
     /// Emit a data-only descriptor for another agent
     Connect {
@@ -172,7 +204,30 @@ enum Clipboard {
     Set { text: String },
 }
 #[derive(Subcommand)]
+enum Transfer {
+    Status { id: String },
+    Cancel { id: String },
+}
+#[derive(Subcommand)]
+enum Share {
+    List,
+    Add {
+        name: String,
+        path: PathBuf,
+        /// Permit host writes; VM reset cannot undo them
+        #[arg(long)]
+        write: bool,
+    },
+    Remove {
+        name: String,
+    },
+}
+#[derive(Subcommand)]
 enum Process {
+    /// Release a completed process receipt (current helper required)
+    Forget {
+        id: String,
+    },
     Start {
         #[arg(long, default_value = "workspace")]
         cwd: String,
@@ -196,6 +251,47 @@ enum Process {
         timeout: u64,
     },
 }
+#[derive(clap::Args)]
+struct GraphicsApis {
+    #[arg(long, default_value="gl", value_delimiter=',', value_parser=["gl","gles","vk"])]
+    apis: Vec<String>,
+}
+#[derive(clap::Args)]
+struct GraphicsSelection {
+    #[arg(long, default_value="x64", value_parser=["x64","x86"])]
+    arch: String,
+    #[command(flatten)]
+    selection: GraphicsApis,
+}
+#[derive(Subcommand)]
+enum Graphics {
+    /// Fetch verified runtime components and cache them in this guest
+    Install {
+        #[command(flatten)]
+        selection: GraphicsSelection,
+    },
+    /// Report cached components; presence is not rendering verification
+    Status {
+        #[command(flatten)]
+        selection: GraphicsSelection,
+    },
+    /// Link cached DLLs beside a scoped executable; never overwrite its DLLs
+    Prepare {
+        path: String,
+        #[command(flatten)]
+        selection: GraphicsApis,
+    },
+    /// Prepare and start an owned Windows process with local renderer settings
+    Run {
+        path: String,
+        #[command(flatten)]
+        selection: GraphicsApis,
+        #[arg(long, default_value_t = 60)]
+        timeout: u64,
+        #[arg(last = true)]
+        argv: Vec<String>,
+    },
+}
 #[derive(Subcommand)]
 enum Image {
     List,
@@ -208,6 +304,9 @@ enum Image {
         /// Source checkout to use as the build context
         #[arg(long, default_value = ".")]
         source: PathBuf,
+        /// Include the optional Samba live-share backend
+        #[arg(long)]
+        shares: bool,
     },
     /// Fetch media with a required published SHA-256
     Fetch {
@@ -283,6 +382,45 @@ enum Image {
 fn print(value: Value, json_output: bool) {
     if json_output {
         println!("{}", serde_json::to_string(&value).expect("JSON output"));
+    } else if let Some(categories) = value["categories"].as_array() {
+        println!(
+            "{:<12} {:>14} {:>14}",
+            "Storage", "Allocated MiB", "Logical MiB"
+        );
+        for category in categories {
+            println!(
+                "{:<12} {:>14.1} {:>14.1}",
+                category["category"].as_str().unwrap_or("?"),
+                category["usage"]["allocated_bytes"].as_u64().unwrap_or(0) as f64 / 1_048_576.0,
+                category["usage"]["logical_bytes"].as_u64().unwrap_or(0) as f64 / 1_048_576.0
+            );
+        }
+        if let Some(targets) = value["recovery_targets"]
+            .as_array()
+            .filter(|targets| !targets.is_empty())
+        {
+            println!("\nRecovery targets (prune TARGET previews):");
+            for target in targets {
+                println!(
+                    "{:>9.1} MiB  {}",
+                    target["usage"]["allocated_bytes"].as_u64().unwrap_or(0) as f64 / 1_048_576.0,
+                    target["target"].as_str().unwrap_or("?")
+                );
+            }
+        }
+    } else if let Some(dry_run) = value["dry_run"].as_bool() {
+        println!(
+            "{} {}",
+            if dry_run {
+                "Preview:"
+            } else {
+                "Permanently removed:"
+            },
+            value["target"].as_str().unwrap_or("?")
+        );
+        if dry_run {
+            println!("No files removed; add --execute to remove this recovery copy.");
+        }
     } else if let Some(text) = value.as_str() {
         println!("{text}");
     } else if let Some(text) = value.get("text").and_then(Value::as_str) {
@@ -316,13 +454,29 @@ fn print(value: Value, json_output: bool) {
 pub async fn run() -> Result<()> {
     let cli = Cli::parse();
     state::validate_name(&cli.session)?;
+    ensure!(
+        cli.descriptor.is_none()
+            || !matches!(
+                cli.command,
+                Command::Share { .. } | Command::Storage | Command::Prune { .. }
+            ),
+        "shares and storage require the local lifecycle owner, not an agent descriptor"
+    );
     let result = match cli.command {
         Command::Doctor => lifecycle::doctor().await?,
+        Command::Storage => storage::report(&state::root())?,
+        Command::Prune { target, execute } => storage::prune(&state::root(), &target, execute)?,
         Command::Serve {
             state_dir,
             bind,
             owner: _,
         } => return crate::runtime::serve(state_dir, bind).await,
+        Command::ShareRelay { socket } => {
+            crate::shares::relay(&socket).await?;
+            // Tokio stdin uses an uncancellable blocking read. This short-lived
+            // pipe relay owns no lifecycle state; exit closes its pipes promptly.
+            std::process::exit(0)
+        }
         Command::Open {
             image,
             engine,
@@ -358,6 +512,15 @@ pub async fn run() -> Result<()> {
             lifecycle::delete(&cli.session).await?;
             json!({"session":cli.session,"state":"deleted"})
         }
+        Command::Share { command } => match command {
+            Share::List => lifecycle::list_shares(&cli.session)?,
+            Share::Add { name, path, write } => {
+                lifecycle::change_share(&cli.session, &name, Some(&path), write).await?
+            }
+            Share::Remove { name } => {
+                lifecycle::change_share(&cli.session, &name, None, false).await?
+            }
+        },
         Command::Reset { timeout, no_wait } => {
             lifecycle::reset(&cli.session).await?;
             if !no_wait {
@@ -380,8 +543,12 @@ pub async fn run() -> Result<()> {
         Command::Image { command } => match command {
             Image::List => lifecycle::images()?,
             Image::Media => serde_json::to_value(media::PRESETS)?,
-            Image::Build { engine, source } => {
-                lifecycle::build(&engine, &source).await?;
+            Image::Build {
+                engine,
+                source,
+                shares,
+            } => {
+                lifecycle::build(&engine, &source, shares).await?;
                 json!({"image":lifecycle::RUNNER_IMAGE,"engine":engine})
             }
             Image::Fetch {
@@ -568,12 +735,20 @@ pub async fn run() -> Result<()> {
                         client.guest("process_status", json!({"id":id})).await?
                     }
                     Process::Kill { id } => client.guest("process_kill", json!({"id":id})).await?,
+                    Process::Forget { id } => {
+                        client.guest("process_forget", json!({"id":id})).await?
+                    }
                     Process::Wait { id, timeout } => {
                         let deadline =
                             tokio::time::Instant::now() + Duration::from_secs(timeout.min(3600));
                         loop {
-                            let result = client.guest("process_status", json!({"id":id})).await?;
-                            if result["running"] == false {
+                            let result = tokio::time::timeout_at(
+                                deadline,
+                                client.guest("process_status", json!({"id":id})),
+                            )
+                            .await
+                            .context("process wait deadline (not killed)")??;
+                            if result["running"] == false && result["phase"] != "draining" {
                                 break result;
                             }
                             ensure!(
@@ -584,8 +759,35 @@ pub async fn run() -> Result<()> {
                         }
                     }
                 },
-                Command::Import { local, remote } => client.import(&local, &remote).await?,
+                Command::Graphics { command } => match command {
+                    Graphics::Install { selection } => {
+                        graphics::install(&client, &selection.arch, &selection.selection.apis)
+                            .await?
+                    }
+                    Graphics::Status { selection } => {
+                        graphics::status(&client, &selection.arch, &selection.selection.apis)
+                            .await?
+                    }
+                    Graphics::Prepare { path, selection } => {
+                        graphics::prepare(&client, &path, &selection.apis).await?
+                    }
+                    Graphics::Run {
+                        path,
+                        selection,
+                        timeout,
+                        argv,
+                    } => graphics::run(&client, &path, &selection.apis, &argv, timeout).await?,
+                },
+                Command::Import {
+                    local,
+                    remote,
+                    resume,
+                } => client.import(&local, &remote, resume.as_deref()).await?,
                 Command::Export { remote, local } => client.export(&remote, &local).await?,
+                Command::Transfer { command } => match command {
+                    Transfer::Status { id } => client.transfer(&id, false).await?,
+                    Transfer::Cancel { id } => client.transfer(&id, true).await?,
+                },
                 Command::Connect { output } => {
                     state::write_json(&output, &client.descriptor)?;
                     json!({"descriptor":output,"authority":"data_plane_only"})
@@ -601,6 +803,45 @@ pub async fn run() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn optional_graphics_has_explicit_architecture_apis_and_windows_arguments() {
+        let cli = Cli::try_parse_from([
+            "wdesk",
+            "graphics",
+            "install",
+            "--arch",
+            "x86",
+            "--apis",
+            "gl,gles,vk",
+        ])
+        .unwrap();
+        let Command::Graphics {
+            command: Graphics::Install { selection },
+        } = cli.command
+        else {
+            panic!("graphics install expected")
+        };
+        assert_eq!(selection.arch, "x86");
+        assert_eq!(selection.selection.apis, ["gl", "gles", "vk"]);
+        assert!(Cli::try_parse_from(["wdesk", "graphics", "install", "--arch", "../bad"]).is_err());
+        let cli = Cli::try_parse_from([
+            "wdesk",
+            "graphics",
+            "run",
+            "workspace/app.exe",
+            "--",
+            "$name; literal",
+        ])
+        .unwrap();
+        let Command::Graphics {
+            command: Graphics::Run { argv, .. },
+        } = cli.command
+        else {
+            panic!("graphics run expected")
+        };
+        assert_eq!(argv, ["$name; literal"]);
+    }
 
     #[test]
     fn runner_source_is_portable_and_explicit() {

@@ -29,9 +29,18 @@ only in Windows. Name `powershell.exe` or `cmd.exe` explicitly when a shell is
 needed. `process wait`, `process output`, and `process kill` address owned ids.
 Export useful artifacts before the trusted owner resets the disposable disk.
 Owned processes retain bounded output and have a deadline; check `exit_code`,
-`timed_out` and `output_truncated`. UIA is bounded and can fail on a hung provider;
+`timed_out`, `output_truncated` and `output_complete`. Current helpers retain at
+most 128 completion receipts for ten minutes; `process forget ID` releases one
+early. IDs expire on eviction or helper restart. UIA can fail on a hung provider;
 use pixels when structured context is unavailable. Do not blindly repeat an
 uncertain mutation with a new request id.
+
+Imports/exports stream directly without mounts; progress goes to stderr. Resume
+an interrupted upload with its transfer id only when source, destination and
+helper incarnation still match. `capabilities.shares.grants` lists owner-granted
+live UNC paths; writable host files are not rolled back by VM reset. Agents cannot
+grant new host directories. Optional `graphics run` prepares application-local
+software rendering; inspect renderer/output rather than treating launch as proof.
 
 `wdesk view` gives a human the same console. Human input changes the generation.
 No remote desktop login, engine socket, QMP socket, host mount, or lifecycle

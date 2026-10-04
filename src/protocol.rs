@@ -6,6 +6,21 @@ pub const PROTOCOL: u32 = 1;
 pub const CHUNK: usize = 48 * 1024;
 pub const MAX_FILE: u64 = 4 * 1024 * 1024 * 1024;
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OperationOutcome {
+    NotStarted,
+    Unknown,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct OperationError {
+    pub code: String,
+    pub message: String,
+    pub retryable: bool,
+    pub outcome: OperationOutcome,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Batch {
@@ -179,18 +194,85 @@ pub enum GuestOp {
     ProcessStart,
     ProcessStatus,
     ProcessKill,
+    ProcessForget,
     FileBegin,
     FileWrite,
     FileCommit,
     FileRead,
     FileStat,
     FileAbort,
+    TransferBegin,
+    TransferStatus,
+    TransferCommit,
+    TransferAbort,
+    TransferPause,
+    GraphicsStatus,
+    GraphicsTarget,
+    GraphicsPrepare,
+    GraphicsRun,
     A11y,
+}
+
+impl GuestOp {
+    pub fn is_read_only(&self) -> bool {
+        matches!(
+            self,
+            Self::Health
+                | Self::Windows
+                | Self::ClipboardGet
+                | Self::ProcessStatus
+                | Self::FileRead
+                | Self::FileStat
+                | Self::A11y
+                | Self::TransferStatus
+                | Self::GraphicsStatus
+                | Self::GraphicsTarget
+        )
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn mutations_are_not_safe_read_retries() {
+        for op in [
+            GuestOp::Focus,
+            GuestOp::ClipboardSet,
+            GuestOp::TypeText,
+            GuestOp::Launch,
+            GuestOp::ProcessStart,
+            GuestOp::ProcessKill,
+            GuestOp::ProcessForget,
+            GuestOp::FileBegin,
+            GuestOp::FileWrite,
+            GuestOp::FileCommit,
+            GuestOp::FileAbort,
+            GuestOp::TransferBegin,
+            GuestOp::TransferCommit,
+            GuestOp::TransferAbort,
+            GuestOp::TransferPause,
+            GuestOp::GraphicsPrepare,
+            GuestOp::GraphicsRun,
+        ] {
+            assert!(!op.is_read_only(), "{op:?}");
+        }
+        for op in [
+            GuestOp::Health,
+            GuestOp::Windows,
+            GuestOp::ClipboardGet,
+            GuestOp::ProcessStatus,
+            GuestOp::FileRead,
+            GuestOp::FileStat,
+            GuestOp::A11y,
+            GuestOp::TransferStatus,
+            GuestOp::GraphicsStatus,
+            GuestOp::GraphicsTarget,
+        ] {
+            assert!(op.is_read_only(), "{op:?}");
+        }
+    }
+
     #[test]
     fn strict_actions_and_bounds() {
         assert!(

@@ -50,8 +50,9 @@ from it. Existing sessions retain their original image and configuration.
 
 Delete the preparation session when no longer needed. Deleted sessions go to
 private `trash/`; reset retains `system-before-reset-*.qcow2` in the session
-directory. Remove only unneeded recovery copies to reclaim space; there is no
-automatic garbage collection. Keep bases in place while sessions depend on them.
+directory. `wdesk storage` lists exact recovery targets; `wdesk prune TARGET`
+previews removal and `--execute` permanently removes that copy. No automatic
+garbage collection. Keep bases in place while sessions depend on them.
 
 ## Footprint
 
@@ -60,13 +61,14 @@ Reference Windows 11 Pro 25H2 (26200.6584) measurements, in GiB:
 | Image | ISO | Compressed host base | Guest C: used |
 | --- | ---: | ---: | ---: |
 | Tiny11, lite | 5.14 | 6.35 | 13.69 |
-| Tiny11 Core | 2.96 | 3.70 | 10.46 |
+| Tiny11 Core | 2.96 | 3.97 | 11.02 |
 | Core with CompactOS | 2.96 | 4.33 | 6.52 |
 
-The CLI is about 6.5 MiB. At 2 GiB configured RAM, QEMU used roughly 2.1 GiB
-resident memory, plus 12–20 MiB for the Rust runtime. Early overlays used about
-60 MiB, growing to about 130 MiB during probes. These are observations, not
-workload limits. Windows directory totals can double-count hardlinks.
+The stripped CLI is about 8 MiB. At 2 GiB configured RAM, QEMU used roughly 2.1 GiB
+resident memory, plus 8–20 MiB for the Rust runtime in native tests. Early
+overlays used about 60 MiB, growing to about 130 MiB during probes. These are
+observations, not workload limits. Snapshots vary with OS activity and installed tools;
+Windows directory totals can double-count hardlinks.
 
 Sparse capacity is not allocated storage. Budget for media, preparation disks,
 sealed bases, overlays, and recovery copies. Sealing temporarily needs both the

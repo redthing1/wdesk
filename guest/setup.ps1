@@ -3,7 +3,7 @@ $ErrorActionPreference = 'Stop'
 Start-Transcript -Path 'C:\wdesk-provision.log' -Append
 $root = 'C:\ProgramData\wdesk'
 New-Item -ItemType Directory -Force $root, "$root\workspace", "$root\downloads", "$root\staging" | Out-Null
-Copy-Item "$PSScriptRoot\agent.ps1", "$PSScriptRoot\native.cs", "$PSScriptRoot\a11y.ps1" $root -Force
+Copy-Item "$PSScriptRoot\agent.ps1", "$PSScriptRoot\native.cs", "$PSScriptRoot\a11y.ps1", "$PSScriptRoot\files.cs", "$PSScriptRoot\graphics.cs", "$PSScriptRoot\shares.cs" $root -Force
 # The serial channel belongs to the dedicated interactive test account.
 $sid = (New-Object Security.Principal.NTAccount "$env:COMPUTERNAME\wdesk").Translate([Security.Principal.SecurityIdentifier]).Value
 & icacls $root /inheritance:r /grant:r "*${sid}:(OI)(CI)F" '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' | Out-Null
@@ -27,6 +27,6 @@ if ($Profile -eq 'lite') {
 # Run at normal interactive-user integrity. Provisioning is the only elevated step.
 $command = 'powershell.exe -NoProfile -STA -WindowStyle Hidden -ExecutionPolicy Bypass -File "C:\ProgramData\wdesk\agent.ps1"'
 New-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name wdesk -Value $command -PropertyType String -Force | Out-Null
-@{ profile=$Profile; helper='0.1.0'; provisioned=(Get-Date).ToUniversalTime().ToString('o') } | ConvertTo-Json | Set-Content "$root\provisioning.json" -Encoding UTF8
+@{ profile=$Profile; helper='0.5.1'; provisioned=(Get-Date).ToUniversalTime().ToString('o') } | ConvertTo-Json | Set-Content "$root\provisioning.json" -Encoding UTF8
 # FirstLogonCommands is elevated. Reboot so Run starts the helper at normal integrity.
 Restart-Computer -Force

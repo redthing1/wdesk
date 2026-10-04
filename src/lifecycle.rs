@@ -87,7 +87,7 @@ pub fn images() -> Result<Value> {
     Ok(json!(images))
 }
 
-pub async fn build(engine: &str, source: &Path) -> Result<()> {
+pub async fn build(engine: &str, source: &Path, shares: bool) -> Result<()> {
     ensure!(["podman", "docker"].contains(&engine), "invalid engine");
     let source = fs::canonicalize(source).context("runner source checkout not found")?;
     for path in ["Cargo.toml", "Cargo.lock", "container/Containerfile"] {
@@ -99,6 +99,14 @@ pub async fn build(engine: &str, source: &Path) -> Result<()> {
     let status = Command::new(engine)
         .args(["build", "-f"])
         .arg(source.join("container/Containerfile"))
+        .args([
+            "--build-arg",
+            if shares {
+                "WDESK_SHARES=1"
+            } else {
+                "WDESK_SHARES=0"
+            },
+        ])
         .args(["-t", RUNNER_IMAGE])
         .arg(&source)
         .status()
@@ -108,6 +116,15 @@ pub async fn build(engine: &str, source: &Path) -> Result<()> {
 }
 
 pub async fn fetch(url: &str, expected: &str, output: &Path) -> Result<Value> {
+    fetch_limited(url, expected, output, 16 * 1024 * 1024 * 1024).await
+}
+
+pub(crate) async fn fetch_limited(
+    url: &str,
+    expected: &str,
+    output: &Path,
+    limit: u64,
+) -> Result<Value> {
     ensure!(
         !output.exists(),
         "output already exists; choose another path"
@@ -138,7 +155,7 @@ pub async fn fetch(url: &str, expected: &str, output: &Path) -> Result<Value> {
     use tokio::io::AsyncWriteExt;
     while let Some(chunk) = response.chunk().await? {
         size += chunk.len() as u64;
-        ensure!(size <= 16 * 1024 * 1024 * 1024, "media larger than 16 GiB");
+        ensure!(size <= limit, "download exceeds declared byte limit");
         hash.update(&chunk);
         file.write_all(&chunk).await?;
     }
@@ -154,6 +171,7 @@ pub async fn fetch(url: &str, expected: &str, output: &Path) -> Result<Value> {
 }
 
 pub async fn open(name: &str, image: &str, engine: &str, config: VmConfig) -> Result<()> {
+    let _storage = state::storage_lock(&state::root(), false)?;
     let dir = session_dir(name)?;
     state::private_dir(&dir)?;
     let _lock = state::lock(&dir.join("owner.lock"))?;
@@ -207,6 +225,10 @@ async fn create_overlay(base: &Path, target: &Path) -> Result<()> {
 }
 
 async fn start(dir: &Path, mut session: Session) -> Result<()> {
+    crate::shares::validate(&session.config.shares)?;
+    // Owner state is authoritative; runtime configuration is regenerated so a
+    // failed multi-file update cannot silently restore an old share grant.
+    state::write_json(&dir.join("vm.json"), &session.config)?;
     if session.engine == "native" {
         if native_running(dir, &session.id)? {
             refresh_descriptor(dir, None, &mut session).await?;
@@ -289,6 +311,17 @@ async fn start(dir: &Path, mut session: Session) -> Result<()> {
                 args.extend([
                     "-v".into(),
                     format!("{}:{}:ro", path.display(), path.display()),
+                ]);
+            }
+            for share in &session.config.shares {
+                args.extend([
+                    "--mount".into(),
+                    format!(
+                        "type=bind,src={},dst={}{}",
+                        share.path.display(),
+                        share.path.display(),
+                        if share.read_only { ",readonly" } else { "" }
+                    ),
                 ]);
             }
             args.extend([
@@ -461,13 +494,89 @@ pub async fn stop(name: &str) -> Result<()> {
     stop_locked(&dir, &load(name)?).await
 }
 
-pub async fn delete(name: &str) -> Result<()> {
+pub fn list_shares(name: &str) -> Result<Value> {
+    Ok(json!(load(name)?.config.shares))
+}
+
+pub async fn change_share(
+    name: &str,
+    share_name: &str,
+    path: Option<&Path>,
+    write: bool,
+) -> Result<Value> {
     let dir = session_dir(name)?;
     let _lock = state::lock(&dir.join("owner.lock"))?;
-    let session = load(name)?;
+    let mut session = load(name)?;
+    state::validate_name(share_name)?;
+    // Revocation must never leave a running server with a stale grant.
+    ensure!(
+        !dir.join("client.json").exists(),
+        "stop this session before changing share grants"
+    );
+    if session.engine == "native" {
+        ensure!(
+            !native_running(&dir, &session.id)?,
+            "stop this session first"
+        );
+    } else if let Some(container) = &session.container
+        && container_exists(&session.engine, container).await?
+    {
+        verify_container(&session.engine, container, &session.id).await?;
+        let running = command(
+            &session.engine,
+            &[
+                "inspect".into(),
+                container.clone(),
+                "--format".into(),
+                "{{.State.Running}}".into(),
+            ],
+        )
+        .await?;
+        ensure!(running.trim() != "true", "stop this session first");
+    }
+    if let Some(path) = path {
+        ensure!(
+            !session
+                .config
+                .shares
+                .iter()
+                .any(|s| s.name.eq_ignore_ascii_case(share_name)),
+            "share name already granted; remove it first"
+        );
+        let share = crate::shares::grant(share_name, path, !write)?;
+        let root = fs::canonicalize(state::root())?;
+        ensure!(
+            !share.path.starts_with(&root) && !root.starts_with(&share.path),
+            "share must not overlap private wdesk state"
+        );
+        session.config.shares.push(share);
+        crate::shares::validate(&session.config.shares)?;
+    } else {
+        let before = session.config.shares.len();
+        session
+            .config
+            .shares
+            .retain(|s| !s.name.eq_ignore_ascii_case(share_name));
+        ensure!(session.config.shares.len() != before, "share not granted");
+    }
+    remove_container(&session).await?;
+    session.container = None;
+    state::write_json(&dir.join("owner.json"), &session)?;
+    Ok(
+        json!({"grants":crate::shares::public(&session.config.shares),"next":"open resumes with these grants","host_writes_rollback":false}),
+    )
+}
+
+pub async fn delete(name: &str) -> Result<()> {
+    let _storage = state::storage_lock(&state::root(), false)?;
+    let dir = session_dir(name)?;
+    let _lock = state::lock(&dir.join("owner.lock"))?;
+    let mut session = load(name)?;
     ensure!(session.name == name, "session name mismatch");
     stop_locked(&dir, &session).await?;
     remove_container(&session).await?;
+    session.container = None;
+    state::write_json(&dir.join("owner.json"), &session)?;
     // Move to a private trash area; never recursively delete a caller-supplied path.
     let trash = state::root().join("trash");
     state::private_dir(&trash)?;
@@ -484,6 +593,7 @@ async fn remove_container(session: &Session) -> Result<()> {
     Ok(())
 }
 pub async fn reset(name: &str) -> Result<()> {
+    let _storage = state::storage_lock(&state::root(), false)?;
     let dir = session_dir(name)?;
     let _lock = state::lock(&dir.join("owner.lock"))?;
     let mut session = load(name)?;
@@ -523,6 +633,7 @@ pub fn viewer_url(name: &str) -> Result<String> {
 
 pub async fn wait(name: &str, seconds: u64) -> Result<Value> {
     let client = Client::discover(name, None)?;
+    let needs_shares = load(name).is_ok_and(|s| !s.config.shares.is_empty());
     let deadline = tokio::time::Instant::now() + Duration::from_secs(seconds);
     let screen = tempfile::NamedTempFile::new()?;
     let mut last = String::new();
@@ -536,6 +647,25 @@ pub async fn wait(name: &str, seconds: u64) -> Result<Value> {
             if ["helper_ready", "automation_ready"].contains(&state)
                 && client.screenshot(screen.path()).await.is_ok()
             {
+                if needs_shares {
+                    ensure!(
+                        health["guest"]["features"]["host_shares"] == 1,
+                        "this image needs a current host-share-capable helper; session kept for inspection"
+                    );
+                    let caps = client.get("/v1/capabilities").await?;
+                    if caps["shares"]["attached"] != true {
+                        if last != "attaching_shares" {
+                            eprintln!("wdesk {name}: attaching_shares");
+                            last = "attaching_shares".into();
+                        }
+                        ensure!(
+                            tokio::time::Instant::now() < deadline,
+                            "share attachment deadline; inspect capabilities.shares.error"
+                        );
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        continue;
+                    }
+                }
                 return client.get("/v1/health").await;
             }
         }
@@ -569,6 +699,7 @@ pub async fn import_image(
     guest: Value,
     compress: bool,
 ) -> Result<Value> {
+    let _storage = state::storage_lock(&state::root(), false)?;
     let dir = image_dir(name)?;
     state::private_dir(dir.parent().context("image parent")?)?;
     let _lock = state::lock(&dir.with_extension("lock"))?;
@@ -623,9 +754,14 @@ pub async fn seal(
     media: Option<&Path>,
     compress: bool,
 ) -> Result<Value> {
+    let _storage = state::storage_lock(&state::root(), false)?;
     let dir = session_dir(session_name)?;
     let _lock = state::lock(&dir.join("owner.lock"))?;
     let session = load(session_name)?;
+    ensure!(
+        session.config.shares.is_empty(),
+        "remove live share grants before sealing an independent image"
+    );
     let guest = if let Ok(client) = Client::discover(session_name, None) {
         client.guest("health", json!({})).await.unwrap_or(json!({}))
     } else {
@@ -693,6 +829,7 @@ fn answer_file(
 }
 
 pub async fn install(iso: &Path, name: &str, options: InstallOptions<'_>) -> Result<()> {
+    let _storage = state::storage_lock(&state::root(), false)?;
     let InstallOptions {
         profile,
         index,
@@ -741,6 +878,18 @@ pub async fn install(iso: &Path, name: &str, options: InstallOptions<'_>) -> Res
     fs::write(
         seed_source.join("a11y.ps1"),
         include_bytes!("../guest/a11y.ps1"),
+    )?;
+    fs::write(
+        seed_source.join("files.cs"),
+        include_bytes!("../guest/files.cs"),
+    )?;
+    fs::write(
+        seed_source.join("graphics.cs"),
+        include_bytes!("../guest/graphics.cs"),
+    )?;
+    fs::write(
+        seed_source.join("shares.cs"),
+        include_bytes!("../guest/shares.cs"),
     )?;
     fs::write(
         seed_source.join("setup.ps1"),
@@ -855,9 +1004,9 @@ mod installation_tests {
     #[tokio::test]
     async fn runner_build_requires_a_source_checkout_before_invoking_engine() {
         let source = tempfile::tempdir().unwrap();
-        let error = build("docker", source.path()).await.unwrap_err();
+        let error = build("docker", source.path(), false).await.unwrap_err();
         assert!(error.to_string().contains("missing Cargo.toml"));
-        let error = build("unknown", source.path()).await.unwrap_err();
+        let error = build("unknown", source.path(), false).await.unwrap_err();
         assert!(error.to_string().contains("invalid engine"));
     }
 

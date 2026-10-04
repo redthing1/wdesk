@@ -76,6 +76,26 @@ pub fn lock(path: &Path) -> Result<fs::File> {
     Ok(file)
 }
 
+// Lifecycle operations can proceed concurrently; cleanup needs a stable inventory.
+pub fn storage_lock(root: &Path, exclusive: bool) -> Result<fs::File> {
+    private_dir(root)?;
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(root.join("storage.lock"))?;
+    if exclusive {
+        fs2::FileExt::try_lock_exclusive(&file)
+    } else {
+        fs2::FileExt::try_lock_shared(&file)
+    }
+    .context("storage cleanup or a lifecycle operation is in progress")?;
+    Ok(file)
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Descriptor {
@@ -95,6 +115,18 @@ pub struct VmConfig {
     #[serde(default)]
     pub answer_disk: Option<PathBuf>,
     pub tcg: bool,
+    #[serde(default)]
+    pub shares: Vec<Share>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Share {
+    pub name: String,
+    pub path: PathBuf,
+    pub read_only: bool,
+    pub device: u64,
+    pub inode: u64,
 }
 
 impl Default for VmConfig {
@@ -107,6 +139,7 @@ impl Default for VmConfig {
             seed_iso: None,
             answer_disk: None,
             tcg: false,
+            shares: Vec::new(),
         }
     }
 }

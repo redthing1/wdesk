@@ -48,11 +48,19 @@ wdesk process wait PROCESS_ID --timeout 30
 wdesk export downloads/result.json ./result.json
 ```
 
-Use `--json` for machine output. Coordinates are native pixels; delivery does
-not prove application success. `click`, `type`, and `key` accept `--generation N`
-to reject stale input. Guest execution stays in Windows; files are scoped to
+Use `--json` for machine output; import/export progress goes to stderr.
+New helpers stream files directly, without mounts. Interrupted uploads can use
+`import --resume TRANSFER_ID`; `transfer status` and `transfer cancel` inspect or
+release them. Resume requires the same source, destination, and helper incarnation.
+Coordinates are native pixels; delivery does not prove application success.
+`click`, `type`, and `key` accept `--generation N` to reject stale input.
+Guest execution stays in Windows; files are scoped to
 `workspace/` and `downloads/`. See [agent instructions](skills/wdesk/SKILL.md)
 and [protocol](doc/protocol.md).
+
+Optional [software graphics](doc/graphics.md) supports CPU rendering without a
+physical GPU. Install only the required APIs and application architecture;
+the core guest remains free of graphics SDKs and toolchains.
 
 ## Experiment
 
@@ -69,7 +77,9 @@ wdesk --session exp-a delete
 
 `open` resumes recorded settings. `stop` keeps writes; `reset` cold-boots the
 baseline. Export results first. Reset retains its old disk; deletion moves files
-to recovery trash. Remove those copies separately to reclaim space.
+to recovery trash. `wdesk storage` reports file sizes, allocated space, and exact
+cleanup targets. `wdesk prune TARGET` previews removal; add `--execute` to
+permanently remove that recovery copy. Bases and current disks are never targets.
 
 State defaults to `$XDG_DATA_HOME/wdesk` or `~/.local/share/wdesk`; override with
 `WDESK_HOME`. Keep it private and outside Git. Do not move or remove a base
@@ -92,6 +102,9 @@ retains private helper control.
 Keep descriptors private: they grant desktop access, not lifecycle or viewer
 credentials. `view` supplies a separate browser credential. Browser and agent
 input share one queue.
+
+Optional [live shares](doc/shares.md) grant specific host directories; read-only
+is the default. Direct transfers remain independent and need no share service.
 
 ## Develop
 

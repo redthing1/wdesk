@@ -17,7 +17,7 @@ namespace Wdesk {
     DateTime retry=DateTime.MinValue;
     StringBuilder serialBuffer=new StringBuilder(),fastBuffer=new StringBuilder();
     Decoder decoder=Encoding.UTF8.GetDecoder();
-    byte[] bytes=new byte[65536];char[] chars=new char[65536];
+    byte[] bytes=new byte[65536];char[] chars=new char[Encoding.UTF8.GetMaxCharCount(65536)];
     public string LastTransport {get;private set;}
     public GuestWire(){
       serial=new System.IO.Ports.SerialPort("COM1",115200,System.IO.Ports.Parity.None,8,System.IO.Ports.StopBits.One);
@@ -47,10 +47,18 @@ namespace Wdesk {
     public string ReadRequest(){
       Connect();serialBuffer.Append(serial.ReadExisting());
       string line=Line(serialBuffer,"serial");if(line!=null)return line;
+      return ReadFast();
+    }
+    string ReadFast(){
       if(fast!=null){
         try{
-          if(fast.Available>0){int n=fast.GetStream().Read(bytes,0,Math.Min(bytes.Length,fast.Available));if(n==0){Disconnect();return null;}int count=decoder.GetChars(bytes,0,n,chars,0);fastBuffer.Append(chars,0,count);}
-          else if(fast.Client.Poll(0,System.Net.Sockets.SelectMode.SelectRead)){Disconnect();return null;}
+          string queued=Line(fastBuffer,"tcp_guestfwd");if(queued!=null)return queued;
+          // Readability means data OR EOF. An Available==0 check before Poll
+          // races arriving data; only a zero-byte read proves disconnection.
+          if(fast.Client.Poll(0,System.Net.Sockets.SelectMode.SelectRead)){
+            int n=fast.GetStream().Read(bytes,0,bytes.Length);if(n==0){Disconnect();return null;}
+            int count=decoder.GetChars(bytes,0,n,chars,0);fastBuffer.Append(chars,0,count);
+          }
           return Line(fastBuffer,"tcp_guestfwd");
         }catch(IOException){Disconnect();return null;}catch(System.Net.Sockets.SocketException){Disconnect();return null;}
       }
@@ -153,6 +161,91 @@ namespace Wdesk {
     }
   }
 
+  public static class TransferNative {
+    [DllImport("kernel32.dll",CharSet=CharSet.Unicode,SetLastError=true)]
+    static extern SafeFileHandle CreateFile(string path,uint access,uint share,IntPtr security,uint mode,uint flags,IntPtr template);
+    [DllImport("kernel32.dll",CharSet=CharSet.Unicode,SetLastError=true)]
+    static extern uint GetFinalPathNameByHandle(SafeFileHandle file,StringBuilder path,uint length,uint flags);
+    [DllImport("kernel32.dll",SetLastError=true)]
+    static extern bool SetFileInformationByHandle(SafeFileHandle file,int kind,IntPtr info,uint length);
+    [DllImport("ntdll.dll")]
+    static extern int NtSetInformationFile(SafeFileHandle file,out IOStatus status,IntPtr info,uint length,int kind);
+    [DllImport("ntdll.dll")]
+    static extern uint RtlNtStatusToDosError(int status);
+    [StructLayout(LayoutKind.Sequential)] struct IOStatus {public IntPtr Status;public UIntPtr Information;}
+    [DllImport("kernel32.dll",SetLastError=true)]
+    static extern bool GetFileInformationByHandleEx(SafeFileHandle file,int kind,out AttributeInfo info,uint length);
+    [StructLayout(LayoutKind.Sequential)] struct AttributeInfo {public uint Attributes,Tag;}
+    [StructLayout(LayoutKind.Sequential,CharSet=CharSet.Unicode)]
+    struct RenameInfo {public byte Replace;public IntPtr Root;public uint Length;public char Name;}
+    static void Verify(SafeFileHandle handle,string root,bool directory) {
+      var final=new StringBuilder(32768);uint n=GetFinalPathNameByHandle(handle,final,(uint)final.Capacity,0);
+      string expected="\\\\?\\"+root.TrimEnd('\\');
+      AttributeInfo attributes;
+      if(!GetFileInformationByHandleEx(handle,9,out attributes,8))throw new Win32Exception();
+      if((attributes.Attributes&0x400)!=0)throw new ArgumentException("Reparse points are not allowed");
+      if(n==0 || n>=final.Capacity || !(final.ToString().StartsWith(expected+"\\",StringComparison.OrdinalIgnoreCase) ||
+          (directory && final.ToString().Equals(expected,StringComparison.OrdinalIgnoreCase))))
+        throw new ArgumentException("Opened target escapes configured root");
+    }
+    public static SafeFileHandle Parent(string remote) {
+      string path=Native.ScopedPath(remote,false),parent=Path.GetDirectoryName(path);
+      Directory.CreateDirectory(parent);Native.ScopedPath(remote,false);
+      var handle=CreateFile(parent,0xA0,3,IntPtr.Zero,3,0x02200000,IntPtr.Zero);
+      try {
+        if(handle.IsInvalid)throw new Win32Exception();
+        Verify(handle,"C:\\ProgramData\\wdesk\\"+remote.Split('/')[0],true);
+        return handle;
+      } catch {handle.Dispose();throw;}
+    }
+    public static SafeFileHandle LinkSource(string remote) {
+      string path=Native.ScopedPath(remote,false);
+      var handle=CreateFile(path,0x80010000,1,IntPtr.Zero,3,0x00200000,IntPtr.Zero);
+      try {
+        if(handle.IsInvalid)throw new Win32Exception();
+        Verify(handle,"C:\\ProgramData\\wdesk\\"+remote.Split('/')[0],false);
+        return handle;
+      } catch {handle.Dispose();throw;}
+    }
+    public static FileStream Stage(string path) {
+      string root="C:\\ProgramData\\wdesk\\staging";
+      if(!path.StartsWith(root+"\\",StringComparison.OrdinalIgnoreCase) ||
+          (File.GetAttributes(root)&FileAttributes.ReparsePoint)!=0)throw new ArgumentException("Invalid staging root");
+      var handle=CreateFile(path,0xC0010000,1,IntPtr.Zero,1,0x08000000,IntPtr.Zero);
+      try {
+        if(handle.IsInvalid)throw new Win32Exception();
+        Verify(handle,root,false);
+        return new FileStream(handle,FileAccess.ReadWrite,262144,false);
+      } catch {
+        if(!handle.IsInvalid) {
+          var disposition=Marshal.AllocHGlobal(1);
+          try {Marshal.WriteByte(disposition,1);SetFileInformationByHandle(handle,4,disposition,1);}
+          finally {Marshal.FreeHGlobal(disposition);}
+        }
+        handle.Dispose();throw;
+      }
+    }
+    public static void Promote(FileStream stream,SafeFileHandle parent,string remote) {
+      string path=Native.ScopedPath(remote,false);
+      Verify(parent,"C:\\ProgramData\\wdesk\\"+remote.Split('/')[0],true);
+      byte[] name=Encoding.Unicode.GetBytes(Path.GetFileName(path));
+      int at=(int)Marshal.OffsetOf(typeof(RenameInfo),"Name"),size=Marshal.SizeOf(typeof(RenameInfo))+name.Length;
+      IntPtr info=Marshal.AllocHGlobal(size);
+      try {
+        for(int i=0;i<size;i++)Marshal.WriteByte(info,i,0);
+        Marshal.WriteByte(info,0,1);
+        Marshal.WriteIntPtr(info,(int)Marshal.OffsetOf(typeof(RenameInfo),"Root"),parent.DangerousGetHandle());
+        Marshal.WriteInt32(info,(int)Marshal.OffsetOf(typeof(RenameInfo),"Length"),name.Length);
+        Marshal.Copy(name,0,IntPtr.Add(info,at),name.Length);
+        // The Win32 wrapper rejects non-null RootDirectory on tested Windows.
+        // Native rename keeps resolution anchored to the verified parent handle.
+        IOStatus status;
+        int result=NtSetInformationFile(stream.SafeFileHandle,out status,info,(uint)size,10);
+        if(result<0)throw new Win32Exception((int)RtlNtStatusToDosError(result));
+      } finally {Marshal.FreeHGlobal(info);}
+    }
+  }
+
   public class OwnedProcess : IDisposable {
     [StructLayout(LayoutKind.Sequential)] struct Security {public int Length;public IntPtr Descriptor;[MarshalAs(UnmanagedType.Bool)]public bool Inherit;}
     [StructLayout(LayoutKind.Sequential,CharSet=CharSet.Unicode)] struct Startup {public int cb;public string Reserved,Desktop,Title;public uint X,Y,XSize,YSize,XChars,YChars,Fill,Flags;public ushort Show,Reserved2;public IntPtr ReservedPtr,Input,Output,Error;}
@@ -172,27 +265,36 @@ namespace Wdesk {
     [DllImport("kernel32.dll")] static extern uint WaitForSingleObject(IntPtr process,uint milliseconds);
     [DllImport("kernel32.dll")] static extern bool GetExitCodeProcess(IntPtr process,out uint exit);
     [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
-    IntPtr process,job;Timer timer;Task reader;StringBuilder output=new StringBuilder();object gate=new object();bool truncated=false,timedOut=false,disposed=false;int outputLimit;
+    IntPtr process,job;Timer timer;Task reader;StringBuilder output=new StringBuilder();object gate=new object(),life=new object();bool truncated=false,timedOut=false,disposed=false;int outputLimit;object exitCode;
     public uint Pid {get;private set;}
-    public bool Running {get{return WaitForSingleObject(process,0)==258;}}
-    public bool TimedOut {get{return timedOut;}}
+    public bool Running {get{lock(life)return process!=IntPtr.Zero&&WaitForSingleObject(process,0)==258;}}
+    public bool TimedOut {get{lock(life)return timedOut;}}
     public bool Truncated {get{lock(gate)return truncated;}}
-    public object ExitCode {get{uint code;if(Running)return null;GetExitCodeProcess(process,out code);return code;}}
+    public object ExitCode {get{lock(life){uint code;if(Running)return null;if(process!=IntPtr.Zero&&GetExitCodeProcess(process,out code))exitCode=code;return exitCode;}}}
     public string Output {get{lock(gate)return output.ToString();}}
+    public bool OutputComplete {get{return reader!=null&&reader.Status==TaskStatus.RanToCompletion;}}
     public OwnedProcess(string[] argv,string cwd,int seconds):this(argv,cwd,seconds,65536){}
-    public OwnedProcess(string[] argv,string cwd,int seconds,int retainCharacters){
+    public OwnedProcess(string[] argv,string cwd,int seconds,int retainCharacters):this(argv,cwd,seconds,retainCharacters,null){}
+    public OwnedProcess(string[] argv,string cwd,int seconds,int retainCharacters,System.Collections.Generic.Dictionary<string,string> environment){
       if(retainCharacters<1||retainCharacters>1048576)throw new ArgumentException("Invalid output limit");outputLimit=retainCharacters;
       if(argv==null||argv.Length==0||argv.Length>128||seconds<1||seconds>3600)throw new ArgumentException("Invalid process options");
       var line=new StringBuilder();foreach(string arg in argv){if(line.Length>0)line.Append(' ');line.Append(Native.Quote(arg));}if(line.Length>30000)throw new ArgumentException("Command line too long");
-      IntPtr read=IntPtr.Zero,write=IntPtr.Zero;ProcessInfo info=new ProcessInfo();
+      IntPtr read=IntPtr.Zero,write=IntPtr.Zero,env=IntPtr.Zero;ProcessInfo info=new ProcessInfo();
       try{
+        if(environment!=null) {
+          var values=new System.Collections.Generic.SortedDictionary<string,string>(StringComparer.OrdinalIgnoreCase);
+          foreach(System.Collections.DictionaryEntry entry in Environment.GetEnvironmentVariables())values[(string)entry.Key]=(string)entry.Value;
+          foreach(var entry in environment)values[entry.Key]=entry.Value;
+          var block=new StringBuilder();foreach(var entry in values)block.Append(entry.Key).Append('=').Append(entry.Value).Append('\0');block.Append('\0');
+          env=Marshal.StringToHGlobalUni(block.ToString());
+        }
         job=CreateJobObject(IntPtr.Zero,null);if(job==IntPtr.Zero)throw new Win32Exception();
         var limits=new JobExtended();limits.Basic.Flags=0x2000;
         if(!SetInformationJobObject(job,9,ref limits,(uint)Marshal.SizeOf(typeof(JobExtended))))throw new Win32Exception();
         var security=new Security{Length=Marshal.SizeOf(typeof(Security)),Inherit=true};
         if(!CreatePipe(out read,out write,ref security,0)||!SetHandleInformation(read,1,0))throw new Win32Exception();
         var start=new Startup{cb=Marshal.SizeOf(typeof(Startup)),Flags=0x100,Output=write,Error=write,Input=IntPtr.Zero};
-        if(!CreateProcess(Native.Executable(argv[0]),line,IntPtr.Zero,IntPtr.Zero,true,4|0x08000000,IntPtr.Zero,cwd,ref start,out info))throw new Win32Exception();
+        if(!CreateProcess(Native.Executable(argv[0]),line,IntPtr.Zero,IntPtr.Zero,true,4|0x08000000|0x400,env,cwd,ref start,out info))throw new Win32Exception();
         process=info.Process;Pid=info.Pid;
         if(!AssignProcessToJobObject(job,process))throw new Win32Exception();
         var handle=new SafeFileHandle(read,true);read=IntPtr.Zero;
@@ -201,13 +303,73 @@ namespace Wdesk {
             var buffer=new char[4096];int count;while((count=text.Read(buffer,0,buffer.Length))>0){lock(gate){int remaining=outputLimit-output.Length;int n=Math.Min(count,remaining);if(n>0)output.Append(buffer,0,n);if(n<count)truncated=true;}}
           }
         });
-        timer=new Timer(delegate{if(Running){timedOut=true;Kill();}},null,seconds*1000,Timeout.Infinite);
+        timer=new Timer(delegate{lock(life){if(Running){timedOut=true;Kill();}}},null,seconds*1000,Timeout.Infinite);
         if(ResumeThread(info.Thread)==UInt32.MaxValue)throw new Win32Exception();
       }catch{if(process!=IntPtr.Zero)TerminateProcess(process,1);Dispose();throw;}
-      finally{if(read!=IntPtr.Zero)CloseHandle(read);if(write!=IntPtr.Zero)CloseHandle(write);if(info.Thread!=IntPtr.Zero)CloseHandle(info.Thread);}
+      finally{if(env!=IntPtr.Zero)Marshal.FreeHGlobal(env);if(read!=IntPtr.Zero)CloseHandle(read);if(write!=IntPtr.Zero)CloseHandle(write);if(info.Thread!=IntPtr.Zero)CloseHandle(info.Thread);}
     }
-    public void Kill(){if(job!=IntPtr.Zero)TerminateJobObject(job,1);}
-    public void Drain(){if(!Running&&reader!=null)reader.Wait(1000);}
-    public void Dispose(){if(disposed)return;disposed=true;if(timer!=null)timer.Dispose();if(job!=IntPtr.Zero)CloseHandle(job);if(process!=IntPtr.Zero)CloseHandle(process);job=IntPtr.Zero;process=IntPtr.Zero;}
+    public void Kill(){lock(life){if(job!=IntPtr.Zero)TerminateJobObject(job,1);}}
+    // Parent exit is the end of an owned process tree, not permission for its
+    // descendants to keep running or hold redirected pipes open indefinitely.
+    public void FinishTree(){lock(life){if(!Running){exitCode=ExitCode;if(timer!=null)timer.Dispose();if(job!=IntPtr.Zero)CloseHandle(job);job=IntPtr.Zero;}}}
+    public void Drain(){FinishTree();if(!Running&&reader!=null)reader.Wait(1000);}
+    public void Dispose(){lock(life){if(disposed)return;disposed=true;exitCode=ExitCode;if(timer!=null)timer.Dispose();if(job!=IntPtr.Zero)CloseHandle(job);if(process!=IntPtr.Zero)CloseHandle(process);job=IntPtr.Zero;process=IntPtr.Zero;}}
+  }
+
+  // Handles are retired independently of desktop requests. Only bounded,
+  // immutable completion receipts survive; ids expire on eviction or restart.
+  public sealed class Processes : IDisposable {
+    public const int ActiveLimit=128,ReceiptLimit=128,ReceiptSeconds=600;
+    sealed class Entry {public OwnedProcess Process;public long Exited;}
+    sealed class Receipt {public System.Collections.Generic.Dictionary<string,object> Result;public long Completed;public System.Collections.Generic.LinkedListNode<string> Node;}
+    readonly object gate=new object();bool disposed;
+    readonly System.Collections.Generic.Dictionary<string,Entry> active=new System.Collections.Generic.Dictionary<string,Entry>();
+    readonly System.Collections.Generic.Dictionary<string,Receipt> completed=new System.Collections.Generic.Dictionary<string,Receipt>();
+    readonly System.Collections.Generic.LinkedList<string> order=new System.Collections.Generic.LinkedList<string>();
+    readonly Timer timer;
+    static long Now {get{return System.Diagnostics.Stopwatch.GetTimestamp();}}
+    static bool Older(long start,int seconds){return Now-start>=seconds*System.Diagnostics.Stopwatch.Frequency;}
+    public Processes(){timer=new Timer(delegate{lock(gate){if(!disposed)Reap();}},null,250,250);}
+    static System.Collections.Generic.Dictionary<string,object> Snapshot(string id,OwnedProcess p,string phase){
+      return new System.Collections.Generic.Dictionary<string,object>{{"id",id},{"pid",p.Pid},{"running",p.Running},{"phase",phase},{"exit_code",p.ExitCode},{"output",p.Output},{"output_truncated",p.Truncated},{"output_complete",p.OutputComplete},{"timed_out",p.TimedOut}};
+    }
+    void Reap(){
+      foreach(var pair in new System.Collections.Generic.List<System.Collections.Generic.KeyValuePair<string,Entry>>(active)){
+        var entry=pair.Value;var p=entry.Process;if(p.Running)continue;
+        p.FinishTree();if(entry.Exited==0)entry.Exited=Now;
+        if(!p.OutputComplete&&!Older(entry.Exited,2))continue;
+        var result=Snapshot(pair.Key,p,"completed");p.Dispose();active.Remove(pair.Key);
+        completed[pair.Key]=new Receipt{Result=result,Completed=Now,Node=order.AddLast(pair.Key)};
+      }
+      while(order.Count>0){
+        string id=order.First.Value;Receipt receipt=completed[id];
+        if(completed.Count<=ReceiptLimit&&!Older(receipt.Completed,ReceiptSeconds))break;
+        completed.Remove(id);order.RemoveFirst();
+      }
+    }
+    public System.Collections.Generic.Dictionary<string,object> Start(string[] argv,string cwd,int seconds,System.Collections.Generic.Dictionary<string,string> environment){
+      lock(gate){
+        if(disposed)throw new ObjectDisposedException("Processes");Reap();
+        if(active.Count>=ActiveLimit)throw new InvalidOperationException("Active process limit (128); wait for completion or kill an owned process");
+        string id=Guid.NewGuid().ToString();var p=new OwnedProcess(argv,cwd,seconds,65536,environment);
+        active[id]=new Entry{Process=p};return Snapshot(id,p,p.Running?"running":"draining");
+      }
+    }
+    public System.Collections.Generic.Dictionary<string,object> Get(string id){
+      lock(gate){Reap();Entry entry;Receipt receipt;
+        if(active.TryGetValue(id,out entry))return Snapshot(id,entry.Process,entry.Process.Running?"running":"draining");
+        if(completed.TryGetValue(id,out receipt))return new System.Collections.Generic.Dictionary<string,object>(receipt.Result);
+        throw new InvalidOperationException("Unknown or expired process id; completions retain at most 128 receipts for 10 minutes in this helper incarnation");
+      }
+    }
+    public System.Collections.Generic.Dictionary<string,object> Kill(string id){
+      lock(gate){Entry entry;if(active.TryGetValue(id,out entry))entry.Process.Kill();return Get(id);}
+    }
+    public void Forget(string id){
+      lock(gate){Reap();if(active.ContainsKey(id))throw new InvalidOperationException("Process is running or draining; wait or kill before forgetting");
+        Receipt receipt;if(!completed.TryGetValue(id,out receipt))throw new InvalidOperationException("Unknown or expired process id");completed.Remove(id);order.Remove(receipt.Node);
+      }
+    }
+    public void Dispose(){lock(gate){if(disposed)return;disposed=true;timer.Dispose();foreach(var entry in active.Values)entry.Process.Dispose();active.Clear();completed.Clear();order.Clear();}}
   }
 }

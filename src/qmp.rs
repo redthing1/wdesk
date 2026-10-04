@@ -140,6 +140,18 @@ pub struct GuestChannel {
     path: PathBuf,
     stream: Option<BufReader<UnixStream>>,
 }
+
+#[derive(Debug)]
+pub struct GuestFailure(pub String);
+
+impl std::fmt::Display for GuestFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "guest: {}", self.0)
+    }
+}
+
+impl std::error::Error for GuestFailure {}
+
 impl GuestChannel {
     pub fn new(path: PathBuf) -> Self {
         Self { path, stream: None }
@@ -148,6 +160,7 @@ impl GuestChannel {
         self.stream = None;
     }
     pub async fn request(&mut self, request: Value) -> Result<Value> {
+        let operation = request["op"].as_str().unwrap_or("unknown").to_owned();
         let reply = timeout(Duration::from_secs(25), self.exchange(request)).await;
         let reply = match reply {
             Ok(Ok(reply)) => reply,
@@ -157,17 +170,21 @@ impl GuestChannel {
             }
             Err(error) => {
                 self.disconnect();
-                return Err(error)
-                    .context("guest helper deadline exceeded; guest may be booting or locked");
+                return Err(error).with_context(|| {
+                    format!("guest helper deadline exceeded during {operation}; delivery may be uncertain")
+                });
             }
         };
         if reply["ok"] == true {
             return Ok(reply["result"].clone());
         }
-        bail!(
-            "guest: {}",
-            reply["error"].as_str().unwrap_or("operation failed")
-        );
+        Err(GuestFailure(
+            reply["error"]
+                .as_str()
+                .unwrap_or("operation failed")
+                .to_owned(),
+        )
+        .into())
     }
     async fn exchange(&mut self, request: Value) -> Result<Value> {
         if self.stream.is_none() {
@@ -209,6 +226,36 @@ impl GuestChannel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn helper_rejection_is_distinct_from_transport_failure() {
+        let scratch = tempfile::tempdir().unwrap();
+        let path = scratch.path().join("guest.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let helper = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut stream = BufReader::new(stream);
+            let mut line = String::new();
+            stream.read_line(&mut line).await.unwrap();
+            let request: Value = serde_json::from_str(&line).unwrap();
+            let reply = json!({"id":request["id"],"ok":false,"error":"invalid path"});
+            stream
+                .get_mut()
+                .write_all(format!("{reply}\n").as_bytes())
+                .await
+                .unwrap();
+        });
+        let failure = guest(&path, json!({"op":"file_stat","args":{}}))
+            .await
+            .unwrap_err();
+        assert!(failure.downcast_ref::<GuestFailure>().is_some());
+        assert_eq!(failure.to_string(), "guest: invalid path");
+        helper.await.unwrap();
+        let failure = guest(&scratch.path().join("missing.sock"), json!({"op":"health"}))
+            .await
+            .unwrap_err();
+        assert!(failure.downcast_ref::<GuestFailure>().is_none());
+    }
+
     #[test]
     fn native_coordinates_map_to_full_tablet_range() {
         let e = move_events(1023, 767, 1024, 768);

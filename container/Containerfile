@@ -1,4 +1,4 @@
-FROM rust:1.97-bookworm AS build
+FROM docker.io/library/rust:1.97-bookworm AS build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
@@ -6,7 +6,9 @@ COPY assets ./assets
 COPY guest ./guest
 RUN cargo build --locked --release
 
-FROM debian:bookworm-slim
+FROM docker.io/library/debian:bookworm-slim
+ARG WDESK_SHARES=0
 RUN apt-get update && apt-get install -y --no-install-recommends qemu-system-x86 qemu-utils ca-certificates && rm -rf /var/lib/apt/lists/*
+RUN if [ "$WDESK_SHARES" = 1 ]; then apt-get update && apt-get install -y --no-install-recommends samba libnss-wrapper && rm -rf /var/lib/apt/lists/*; fi
 COPY --from=build /src/target/release/wdesk /usr/local/bin/wdesk
 ENTRYPOINT ["/usr/local/bin/wdesk"]

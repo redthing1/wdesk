@@ -1,16 +1,17 @@
 # Runs in the logged-in console user's STA apartment, never as a Windows service.
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Windows.Forms
-Add-Type -Path "$PSScriptRoot\native.cs"
+Add-Type -Path @("$PSScriptRoot\native.cs", "$PSScriptRoot\files.cs", "$PSScriptRoot\graphics.cs", "$PSScriptRoot\shares.cs")
 [Wdesk.Native]::Init()
-$processes = @{}
+$processes = [Wdesk.Processes]::new()
 $transfers = @{}
 $root = 'C:\ProgramData\wdesk'
 $helperId=[Guid]::NewGuid().ToString()
+$files=[Wdesk.Files]::new($helperId)
 $os=Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
 $helperHash = [Security.Cryptography.SHA256]::Create()
 $helperBytes = New-Object IO.MemoryStream
-foreach ($file in @('agent.ps1','native.cs','a11y.ps1')) {
+foreach ($file in @('agent.ps1','native.cs','a11y.ps1','files.cs','graphics.cs','shares.cs')) {
     $name = [Text.Encoding]::UTF8.GetBytes($file + [char]0)
     $helperBytes.Write($name,0,$name.Length)
     $bytes = [IO.File]::ReadAllBytes("$PSScriptRoot\$file")
@@ -30,10 +31,7 @@ function Hash-Stream($stream) {
     try { return ([BitConverter]::ToString($hash.ComputeHash($stream))).Replace('-','').ToLowerInvariant() } finally { $hash.Dispose() }
 }
 function Process-Result($id) {
-    if (-not $processes.ContainsKey($id)) { throw 'Unknown process id (ids expire when helper restarts)' }
-    $p = $processes[$id]
-    $p.Drain()
-    return @{ id=$id; pid=$p.Pid; running=$p.Running; exit_code=$p.ExitCode; output=$p.Output; output_truncated=$p.Truncated; timed_out=$p.TimedOut }
+    return $processes.Get([string]$id)
 }
 function Dispatch($request) {
     Check-Fields $request @('id','op','args')
@@ -41,7 +39,11 @@ function Dispatch($request) {
     switch ($request.op) {
         'health' {
             Check-Fields $a @()
-            return @{ protocol=1; helper_version='0.1.0'; helper_id=$helperId; helper_sha256=$helperSha256; interactive=[Wdesk.Native]::Interactive(); session_id=[Diagnostics.Process]::GetCurrentProcess().SessionId; build=[Environment]::OSVersion.Version.ToString(); windows=@{build=$os.CurrentBuild;revision=$os.UBR;version=$os.DisplayVersion;product=$os.ProductName}; user=[Environment]::UserName; profile=(Get-Content "$root\provisioning.json" -Raw | ConvertFrom-Json).profile }
+            return @{ protocol=1; helper_version='0.5.1'; helper_id=$helperId; helper_sha256=$helperSha256; features=@{binary_files=1;range_identity=1;software_graphics=1;host_shares=1;process_retention=1}; interactive=[Wdesk.Native]::Interactive(); session_id=[Diagnostics.Process]::GetCurrentProcess().SessionId; build=[Environment]::OSVersion.Version.ToString(); windows=@{build=$os.CurrentBuild;revision=$os.UBR;version=$os.DisplayVersion;product=$os.ProductName}; user=[Environment]::UserName; profile=(Get-Content "$root\provisioning.json" -Raw | ConvertFrom-Json).profile }
+        }
+        'owner_shares_attach' {
+            Check-Fields $a @('address','username','password','shares')
+            return [Wdesk.Shares]::Attach([string]$a.address,[string]$a.username,[string]$a.password,[string[]]@($a.shares | ForEach-Object { $_.name }))
         }
         'windows' { Check-Fields $a @(); return @{ windows=@([Wdesk.Native]::Windows() | ForEach-Object {@{id="${helperId}:$($_.id)";pid=$_.pid;title=$_.title;focused=$_.focused;bounds=$_.bounds}}) } }
         'focus' { Check-Fields $a @('id'); $prefix=$helperId+':'; if (-not ([string]$a.id).StartsWith($prefix)) {throw 'Stale window id; inspect windows again'}; if (-not [Wdesk.Native]::Focus(([string]$a.id).Substring($prefix.Length))) { throw 'Windows refused foreground focus' }; return @{ focused=$true; id=$a.id } }
@@ -60,16 +62,32 @@ function Dispatch($request) {
         }
         'process_start' {
             Check-Fields $a @('argv','cwd','timeout_seconds')
-            if ($processes.Count -ge 128) { throw 'Process registry full (128); restart helper to reclaim ids' }
             $cwd=[Wdesk.Native]::ScopedPath([string]$a.cwd,$true)
             if (-not [IO.Directory]::Exists($cwd)) { throw 'Working directory does not exist' }
-            $id=[Guid]::NewGuid().ToString()
-            $p=[Wdesk.OwnedProcess]::new([string[]]$a.argv, $cwd, [int]$a.timeout_seconds)
-            $processes[$id]=$p
-            return Process-Result $id
+            return $processes.Start([string[]]$a.argv, $cwd, [int]$a.timeout_seconds, $null)
         }
         'process_status' { Check-Fields $a @('id'); return Process-Result ([string]$a.id) }
-        'process_kill' { Check-Fields $a @('id'); if (-not $processes.ContainsKey([string]$a.id)) { throw 'Unknown process id' }; $processes[[string]$a.id].Kill(); return Process-Result ([string]$a.id) }
+        'graphics_status' { Check-Fields $a @('architecture','apis'); return [Wdesk.Graphics]::Status([string]$a.architecture,[string[]]$a.apis) }
+        'graphics_target' { Check-Fields $a @('path'); return [Wdesk.Graphics]::Target([string]$a.path) }
+        'graphics_prepare' { Check-Fields $a @('path','apis'); return [Wdesk.Graphics]::Prepare([string]$a.path,[string[]]$a.apis) }
+        'graphics_run' {
+            Check-Fields $a @('path','apis','argv','timeout_seconds')
+            $path=[string]$a.path; $apis=[string[]]$a.apis
+            $prepared=[Wdesk.Graphics]::Prepare($path,$apis)
+            $executable=[Wdesk.Native]::ScopedPath($path,$false)
+            $argv=[string[]](@($executable)+@($a.argv))
+            return $processes.Start($argv,[IO.Path]::GetDirectoryName($executable),[int]$a.timeout_seconds,[Wdesk.Graphics]::EnvironmentFor($prepared.architecture,$apis))
+        }
+        'process_kill' { Check-Fields $a @('id'); return $processes.Kill([string]$a.id) }
+        'process_forget' { Check-Fields $a @('id'); $processes.Forget([string]$a.id); return @{id=[string]$a.id;forgotten=$true} }
+        'transfer_begin' {
+            Check-Fields $a @('transfer','helper_id','direction','path','size','sha256')
+            return $files.Begin([string]$a.transfer,[string]$a.helper_id,[string]$a.direction,[string]$a.path,[long]$a.size,[string]$a.sha256)
+        }
+        'transfer_status' { Check-Fields $a @('transfer','helper_id'); return $files.Status([string]$a.transfer,[string]$a.helper_id) }
+        'transfer_commit' { Check-Fields $a @('transfer','helper_id'); return $files.Commit([string]$a.transfer,[string]$a.helper_id) }
+        'transfer_abort' { Check-Fields $a @('transfer','helper_id'); return $files.Cancel([string]$a.transfer,[string]$a.helper_id) }
+        'transfer_pause' { Check-Fields $a @('transfer','helper_id'); return $files.Pause([string]$a.transfer,[string]$a.helper_id) }
         'file_begin' {
             Check-Fields $a @('path','transfer','size')
             $id=[string]$a.transfer
@@ -150,7 +168,8 @@ try {
     }
 } catch { $_ | Out-String | Add-Content "$root\agent-error.log"; throw }
 finally {
-    foreach ($p in $processes.Values) { $p.Dispose() }
+    $files.Dispose()
+    $processes.Dispose()
     foreach ($t in $transfers.Values) { $t.stream.Dispose() }
     $wire.Dispose()
 }

@@ -36,6 +36,15 @@ test "$new_epoch" != "$epoch"
 new_endpoint="$(jq -r .endpoint "$descriptor")"
 code="$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $token" "$new_endpoint/v1/health")"
 test "$code" = 401
+"$bin" --json storage >"$scratch/storage.json"
+recovery="$(jq -er '.recovery_targets[] | select(.target | startswith("recovery/")) | .target' "$scratch/storage.json")"
+"$bin" --json prune "$recovery" >"$scratch/prune-preview.json"
+jq -e '.dry_run and (.removed == false)' "$scratch/prune-preview.json" >/dev/null
+"$bin" --json prune "$recovery" --execute | jq -e '.removed and (.dry_run == false)' >/dev/null
+"$bin" --json storage | jq -e '.recovery_targets | length == 0' >/dev/null
+if WDESK_DESCRIPTOR="$descriptor" "$bin" storage >/dev/null 2>&1; then echo 'Agent accessed owner storage' >&2; exit 1; fi
 "$bin" --session "$session" delete >/dev/null
+trash="$("$bin" --json storage | jq -er '.recovery_targets[0].target')"
+"$bin" --json prune "$trash" --execute | jq -e '.removed' >/dev/null
 trap - EXIT
 echo "QEMU smoke passed; artifacts retained in $scratch"

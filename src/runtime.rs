@@ -1,5 +1,5 @@
 use crate::{
-    protocol::{Action, Batch, GuestOp, GuestRequest},
+    protocol::{Action, Batch, GuestOp, GuestRequest, OperationError, OperationOutcome},
     qmp::{self, Qmp},
     state::{self, Descriptor, VmConfig},
 };
@@ -38,7 +38,10 @@ pub struct Runtime {
     pub guest_lock: Mutex<()>,
     pub fast_ready: AtomicBool,
     pub fast_channel: Mutex<qmp::GuestChannel>,
+    pub bulk_channel: Arc<Mutex<crate::transfers::Channel>>,
+    pub bulk_interrupt: std::sync::Mutex<Option<crate::transfers::Interrupt>>,
     pub health: RwLock<Value>,
+    pub shares: Option<Arc<Mutex<crate::shares::Server>>>,
 }
 
 pub struct InputState {
@@ -118,14 +121,40 @@ pub fn vm_args(state_dir: &Path, run_dir: &Path, config: &VmConfig) -> Result<Ve
             "socket,id=fast,path={}/fast.sock,server=on,wait=off",
             run_dir.display()
         ),
+        "-chardev".into(),
+        format!(
+            "socket,id=bulk,path={}/bulk.sock,server=on,wait=off",
+            run_dir.display()
+        ),
         "-netdev".into(),
         format!(
-            "user,id=net0,restrict={},ipv6=off,guestfwd=tcp:10.0.2.100:9843-chardev:fast",
+            "user,id=net0,restrict={},ipv6=off,guestfwd=tcp:10.0.2.100:9843-chardev:fast,guestfwd=tcp:10.0.2.101:9844-chardev:bulk",
             if config.offline { "on" } else { "off" }
         ),
         "-device".into(),
         "e1000e,netdev=net0".into(),
     ];
+    if !config.shares.is_empty() {
+        ensure!(
+            run_dir
+                .as_os_str()
+                .as_encoded_bytes()
+                .iter()
+                .all(|b| b.is_ascii_alphanumeric() || b"/._-".contains(b)),
+            "share relay requires a generated safe runtime directory"
+        );
+        let net = args
+            .iter_mut()
+            .find(|arg| arg.starts_with("user,id=net0,"))
+            .unwrap();
+        // QEMU's inetd-like path closes each SMB connection independently.
+        // Only generated paths/numeric IDs enter this command, never guest argv.
+        net.push_str(&format!(
+            ",guestfwd=tcp:10.0.2.102:445-cmd:/proc/{}/exe share-relay --socket {}/smb.sock",
+            std::process::id(),
+            run_dir.display()
+        ));
+    }
     if let Some(iso) = &config.install_iso {
         args.extend([
             "-drive".into(),
@@ -162,6 +191,13 @@ pub async fn serve(state_dir: PathBuf, bind: String) -> Result<()> {
     let run_dir = tempfile::Builder::new()
         .prefix("wdesk-")
         .tempdir_in("/tmp")?;
+    let shares = if config.shares.is_empty() {
+        None
+    } else {
+        Some(Arc::new(Mutex::new(
+            crate::shares::Server::start(&config.shares, run_dir.path()).await?,
+        )))
+    };
     let qemu_log = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -220,7 +256,10 @@ pub async fn serve(state_dir: PathBuf, bind: String) -> Result<()> {
         guest_lock: Mutex::new(()),
         fast_ready: AtomicBool::new(false),
         fast_channel: Mutex::new(qmp::GuestChannel::new(run_dir.path().join("fast.sock"))),
+        bulk_channel: Arc::new(Mutex::new(crate::transfers::Channel::default())),
+        bulk_interrupt: std::sync::Mutex::new(None),
         health: RwLock::new(json!({"state":"vm_running","guest":null})),
+        shares: shares.clone(),
     });
     let monitor = tokio::spawn(monitor(runtime.clone()));
     let app = router(runtime);
@@ -233,9 +272,21 @@ pub async fn serve(state_dir: PathBuf, bind: String) -> Result<()> {
     // Use an explicit IntoFuture because axum's graceful server implements it.
     let result = tokio::select! {
         result=&mut server => result.context("HTTP server"),
-        result=qemu.wait()=> { anyhow::bail!("QEMU exited unexpectedly: {:?}",result?); }
+        result=qemu.wait()=> match result {
+            Ok(status)=>Err(anyhow::anyhow!("QEMU exited unexpectedly: {status}")),
+            Err(error)=>Err(error.into()),
+        },
+        result=async {
+            if let Some(shares) = &shares {
+                loop {
+                    shares.lock().await.check()?;
+                    sleep(Duration::from_millis(250)).await;
+                }
+            } else { std::future::pending::<Result<()>>().await }
+        } => result,
     };
     monitor.abort();
+    let _ = monitor.await;
     let _ = qmp_shutdown(run_dir.path()).await;
     for _ in 0..100 {
         if qemu.try_wait()?.is_some() {
@@ -266,6 +317,7 @@ async fn shutdown_signal() {
 }
 
 async fn monitor(runtime: Arc<Runtime>) {
+    let mut share_helper = String::new();
     loop {
         let result = {
             let _guard = runtime.guest_lock.lock().await;
@@ -300,6 +352,26 @@ async fn monitor(runtime: Arc<Runtime>) {
         };
         if let Some(next) = value["guest"]["helper_id"].as_str() {
             runtime.input.lock().await.note_guest(next);
+            if let Some(shares) = &runtime.shares
+                && share_helper != next
+            {
+                shares.lock().await.attached = false;
+                if value["guest"]["features"]["host_shares"] == 1 {
+                    let request = shares.lock().await.attachment();
+                    let result = {
+                        let _guard = runtime.guest_lock.lock().await;
+                        runtime.guest_request(request).await
+                    };
+                    let mut server = shares.lock().await;
+                    match result {
+                        Ok(_) => { server.attached = true; server.error = None; share_helper = next.into(); }
+                        Err(_) => server.error = Some("guest share attachment failed; inspect guest readiness and owner configuration".into()),
+                    }
+                } else {
+                    shares.lock().await.error =
+                        Some("prepare a current host-share-capable helper image".into());
+                }
+            }
         }
         *runtime.health.write().await = value;
         sleep(Duration::from_secs(5)).await;
@@ -307,18 +379,57 @@ async fn monitor(runtime: Arc<Runtime>) {
 }
 
 impl Runtime {
-    async fn guest_request(&self, request: Value) -> Result<Value> {
+    #[cfg(test)]
+    pub(crate) fn fixture(run_dir: &Path, health: Value) -> Arc<Self> {
+        Arc::new(Self {
+            descriptor: Descriptor {
+                protocol: 1,
+                endpoint: "http://127.0.0.1:1".into(),
+                token: "data-secret".into(),
+                epoch: "test-epoch".into(),
+            },
+            viewer_token: "viewer-secret".into(),
+            run_dir: run_dir.into(),
+            qmp: Qmp::new(run_dir.join("qmp.sock")),
+            input: Mutex::new(InputState {
+                generation: 0,
+                observation: 0,
+                width: 0,
+                height: 0,
+                guest_epoch: None,
+                cache: VecDeque::new(),
+            }),
+            guest_lock: Mutex::new(()),
+            fast_ready: AtomicBool::new(false),
+            fast_channel: Mutex::new(qmp::GuestChannel::new(run_dir.join("fast.sock"))),
+            bulk_channel: Arc::new(Mutex::new(crate::transfers::Channel::default())),
+            bulk_interrupt: std::sync::Mutex::new(None),
+            health: RwLock::new(health),
+            shares: None,
+        })
+    }
+    pub(crate) async fn guest_request(&self, request: Value) -> Result<Value> {
         let fast = self.fast_ready.load(Ordering::Relaxed);
         let response = if fast {
             self.fast_channel.lock().await.request(request).await
         } else {
             qmp::guest(&self.run_dir.join("guest.sock"), request).await
         };
-        if response.is_err() && fast {
+        if fast
+            && response
+                .as_ref()
+                .err()
+                .is_some_and(|error| error.downcast_ref::<qmp::GuestFailure>().is_none())
+        {
             self.fast_ready.store(false, Ordering::Relaxed);
         }
         // A failed mutation may already have run. Never retry on another transport.
-        response
+        response.with_context(|| {
+            format!(
+                "guest transport {}",
+                if fast { "tcp_guestfwd" } else { "serial" }
+            )
+        })
     }
 }
 
@@ -329,13 +440,14 @@ pub fn router(runtime: Arc<Runtime>) -> Router {
         .route("/v1/see", get(see))
         .route("/v1/batch", post(batch))
         .route("/v1/guest", post(guest))
+        .merge(crate::transfers::routes())
         .route("/viewer", get(viewer))
         .route("/viewer.js", get(viewer_js))
         .layer(axum::extract::DefaultBodyLimit::max(128 * 1024))
         .with_state(runtime)
 }
 
-fn authorized(runtime: &Runtime, headers: &HeaderMap, allow_viewer: bool) -> bool {
+pub(crate) fn authorized(runtime: &Runtime, headers: &HeaderMap, allow_viewer: bool) -> bool {
     let Some(token) = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
@@ -350,9 +462,25 @@ fn authorized(runtime: &Runtime, headers: &HeaderMap, allow_viewer: bool) -> boo
         || (allow_viewer && bool::from(token.as_bytes().ct_eq(runtime.viewer_token.as_bytes())))
 }
 fn error(status: StatusCode, code: &str, message: impl ToString) -> Response {
-    (status,Json(json!({"ok":false,"error":{"code":code,"message":message.to_string(),"retryable":status==StatusCode::SERVICE_UNAVAILABLE}}))).into_response()
+    operation_error(status, code, message, false, OperationOutcome::NotStarted)
 }
-fn unauthorized() -> Response {
+
+pub(crate) fn operation_error(
+    status: StatusCode,
+    code: &str,
+    message: impl ToString,
+    retryable: bool,
+    outcome: OperationOutcome,
+) -> Response {
+    let error = OperationError {
+        code: code.into(),
+        message: message.to_string().chars().take(4096).collect(),
+        retryable,
+        outcome,
+    };
+    (status, Json(json!({"ok":false,"error":error}))).into_response()
+}
+pub(crate) fn unauthorized() -> Response {
     error(
         StatusCode::UNAUTHORIZED,
         "unauthorized",
@@ -379,8 +507,34 @@ async fn capabilities(State(runtime): State<Arc<Runtime>>, headers: HeaderMap) -
     if !authorized(&runtime, &headers, false) {
         return unauthorized();
     }
-    let ready = runtime.health.read().await["guest"]["interactive"] == true;
-    Json(json!({"protocol":1,"epoch":runtime.descriptor.epoch,"console":{"screenshots":true,"physical_input":true,"cursor_included":false},"guest":{"ready":ready,"transport":if runtime.fast_ready.load(Ordering::Relaxed){"tcp_guestfwd"}else{"serial"},"windows":ready,"clipboard":ready,"processes":ready,"files":ready,"a11y":ready},"limits":{"batch_actions":64,"file_bytes":crate::protocol::MAX_FILE,"chunk_bytes":crate::protocol::CHUNK,"process_output_characters":65536},"input_semantics":"serialized batches; delivery is not application success","viewer":"shared canvas; input serialized with agents"})).into_response()
+    let health = runtime.health.read().await;
+    let ready = health["guest"]["interactive"] == true;
+    let binary = ready && health["guest"]["features"]["binary_files"] == 1;
+    let process_retention = ready && health["guest"]["features"]["process_retention"] == 1;
+    let shares = if let Some(shares) = &runtime.shares {
+        shares.lock().await.public()
+    } else {
+        json!({"backend":null,"grants":[],"attached":false,"host_writes_rollback":false})
+    };
+    Json(json!({
+        "protocol":1,"epoch":runtime.descriptor.epoch,
+        "console":{"screenshots":true,"physical_input":true,"cursor_included":false},
+        "guest":{"ready":ready,"transport":if runtime.fast_ready.load(Ordering::Relaxed){"tcp_guestfwd"}else{"serial"},
+            "windows":ready,"clipboard":ready,"processes":ready,"files":ready,"a11y":ready},
+        "file_transfer":{"binary_stream":binary,"atomic_upload":binary,
+            "range_identity":binary && health["guest"]["features"]["range_identity"]==1,
+            "resume":if binary {"helper_incarnation"} else {"none"},"mount_required":false,"durable":false},
+        "graphics":{"preset_setup":ready && health["guest"]["features"]["software_graphics"]==1,
+            "render_verified":false},
+        "process_retention":if process_retention {
+            json!({"bounded":true,"active_limit":128,"completed_limit":128,"completed_seconds":600})
+        } else { json!({"bounded":false}) },
+        "shares":shares,
+        "limits":{"batch_actions":64,"file_bytes":crate::protocol::MAX_FILE,"chunk_bytes":crate::protocol::CHUNK,
+            "bulk_buffer_bytes":crate::transfers::BUFFER,"process_output_characters":65536},
+        "input_semantics":"serialized batches; delivery is not application success",
+        "viewer":"shared canvas; input serialized with agents"
+    })).into_response()
 }
 
 async fn capture(runtime: &Runtime, input: &mut InputState) -> Result<(Value, Vec<u8>)> {
@@ -411,7 +565,13 @@ async fn see(State(runtime): State<Arc<Runtime>>, headers: HeaderMap) -> Respons
             Bytes::from(bytes),
         )
             .into_response(),
-        Err(e) => error(StatusCode::SERVICE_UNAVAILABLE, "capture_unavailable", e),
+        Err(e) => operation_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "capture_unavailable",
+            e,
+            true,
+            OperationOutcome::Unknown,
+        ),
     }
 }
 
@@ -434,7 +594,13 @@ async fn batch(
     if input.width == 0
         && let Err(e) = capture(&runtime, &mut input).await
     {
-        return error(StatusCode::SERVICE_UNAVAILABLE, "capture_unavailable", e);
+        return operation_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "capture_unavailable",
+            e,
+            true,
+            OperationOutcome::NotStarted,
+        );
     }
     if let Err(e) = batch.validate(input.width, input.height) {
         return error(StatusCode::BAD_REQUEST, "invalid_batch", e);
@@ -608,7 +774,11 @@ async fn guest(
     }
     let _input = if matches!(
         request.op,
-        GuestOp::Focus | GuestOp::TypeText | GuestOp::Launch | GuestOp::ProcessStart
+        GuestOp::Focus
+            | GuestOp::TypeText
+            | GuestOp::Launch
+            | GuestOp::ProcessStart
+            | GuestOp::GraphicsRun
     ) {
         let mut guard = runtime.input.lock().await;
         guard.generation += 1;
@@ -618,11 +788,24 @@ async fn guest(
     };
     let _guard = runtime.guest_lock.lock().await;
     match runtime
-        .guest_request(serde_json::to_value(request).expect("guest request"))
+        .guest_request(serde_json::to_value(&request).expect("guest request"))
         .await
     {
         Ok(value) => Json(value).into_response(),
-        Err(e) => error(StatusCode::SERVICE_UNAVAILABLE, "guest_operation_failed", e),
+        Err(e) => {
+            let rejected = e.downcast_ref::<qmp::GuestFailure>().is_some();
+            operation_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                if rejected {
+                    "guest_rejected"
+                } else {
+                    "guest_operation_failed"
+                },
+                format!("{e:#}"),
+                request.op.is_read_only() && !rejected,
+                OperationOutcome::Unknown,
+            )
+        }
     }
 }
 
@@ -645,6 +828,21 @@ fn asset(kind: &str, body: &'static str) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn errors_have_bounded_unicode_messages_and_explicit_outcomes() {
+        let response = error(StatusCode::BAD_REQUEST, "invalid_request", "λ".repeat(8192));
+        let body = axum::body::to_bytes(response.into_body(), 32768)
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            value["error"]["message"].as_str().unwrap().chars().count(),
+            4096
+        );
+        assert_eq!(value["error"]["outcome"], "not_started");
+        assert_eq!(value["error"]["retryable"], false);
+    }
+
     #[test]
     fn helper_incarnation_survives_unavailable_health() {
         let mut input = InputState {
@@ -686,6 +884,20 @@ mod tests {
             )
             .is_err()
         );
+        let dir = tempfile::tempdir().unwrap();
+        let config = VmConfig {
+            offline: true,
+            shares: vec![crate::shares::grant("source", dir.path(), true).unwrap()],
+            ..Default::default()
+        };
+        let shared = vm_args(Path::new("/state"), Path::new("/tmp/wdesk-a"), &config)
+            .unwrap()
+            .join(" ");
+        assert!(shared.contains("restrict=on"));
+        assert!(shared.contains("guestfwd=tcp:10.0.2.102:445-cmd:/proc/"));
+        assert!(!shared.contains("hostfwd"));
+        assert!(!shared.contains("smb="));
+        assert!(!shared.contains(&dir.path().to_string_lossy().to_string()));
     }
 
     #[tokio::test]
@@ -712,7 +924,10 @@ mod tests {
             guest_lock: Mutex::new(()),
             fast_ready: AtomicBool::new(false),
             fast_channel: Mutex::new(qmp::GuestChannel::new(dir.path().join("missing-fast"))),
+            bulk_channel: Arc::new(Mutex::new(crate::transfers::Channel::default())),
+            bulk_interrupt: std::sync::Mutex::new(None),
             health: RwLock::new(json!({"state":"vm_running","guest":null})),
+            shares: None,
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -720,6 +935,16 @@ mod tests {
             tokio::spawn(async move { axum::serve(listener, router(runtime)).await.unwrap() });
         let http = reqwest::Client::new();
         let base = format!("http://{address}");
+        assert_eq!(
+            http.post(format!("{base}/v1/guest"))
+                .bearer_auth("data-secret")
+                .json(&json!({"op":"owner_shares_attach","args":{}}))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
         assert_eq!(
             http.get(format!("{base}/v1/health"))
                 .send()
@@ -756,6 +981,23 @@ mod tests {
                 .status(),
             StatusCode::UNAUTHORIZED
         );
+        for (op, retryable) in [
+            ("windows", true),
+            ("process_start", false),
+            ("file_write", false),
+        ] {
+            let response = http
+                .post(format!("{base}/v1/guest"))
+                .bearer_auth("data-secret")
+                .json(&json!({"op":op,"args":{}}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            let error: Value = response.json().await.unwrap();
+            assert_eq!(error["error"]["retryable"], retryable);
+            assert_eq!(error["error"]["outcome"], "unknown");
+        }
         let response=http.post(format!("{base}/v1/batch")).bearer_auth("data-secret").json(&json!({"protocol":1,"request_id":"r","epoch":"old","actions":[{"type":"key","keys":["S"]}]})).send().await.unwrap();
         assert_eq!(response.status(), StatusCode::CONFLICT);
         assert_eq!(
