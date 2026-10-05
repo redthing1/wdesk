@@ -10,11 +10,14 @@ rm "$scratch/unlinked-wdesk"
 bin="/proc/$$/fd/9"
 export WDESK_HOME="$scratch/state"
 session="smoke-$$"
+port=$((30000 + $$ % 20000))
 cleanup() { "$bin" --session "$session" stop >/dev/null 2>&1 || true; }
 trap cleanup EXIT
 qemu-img create -f qcow2 "$scratch/blank.qcow2" 128M >/dev/null
 "$bin" image import "$scratch/blank.qcow2" --name blank --compress >/dev/null
-"$bin" --session "$session" open --image blank --no-wait --offline --memory 512 >/dev/null
+"$bin" --session "$session" open --image blank --no-wait --offline --memory 512 --forward "$port:8080" >/dev/null
+"$bin" --session "$session" --json port list | jq -e --arg host "127.0.0.1:$port" '.forwards[0].host == $host' >/dev/null
+if "$bin" --session "$session" port remove "$port" >/dev/null 2>&1; then echo 'Live forward change accepted' >&2; exit 1; fi
 "$bin" --session "$session" --json see --output "$scratch/bios.png" >"$scratch/observation.json"
 jq -e '.geometry.width > 0 and .geometry.height > 0 and .cursor_included == false' "$scratch/observation.json" >/dev/null
 "$bin" --session "$session" --json capabilities | jq -e '.guest.ready == false and .console.physical_input == true' >/dev/null
@@ -33,6 +36,7 @@ if "$bin" --session "$session" batch "$scratch/stale.json" >/dev/null 2>&1; then
 "$bin" --session "$session" --json reset --no-wait >/dev/null
 new_epoch="$(jq -r .epoch "$descriptor")"
 test "$new_epoch" != "$epoch"
+"$bin" --session "$session" --json port list | jq -e '.forwards[0].guest_port == 8080' >/dev/null
 new_endpoint="$(jq -r .endpoint "$descriptor")"
 code="$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $token" "$new_endpoint/v1/health")"
 test "$code" = 401

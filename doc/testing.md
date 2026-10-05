@@ -36,6 +36,12 @@ helper transport, Unicode input/clipboard,
 files, bounded processes, x86 compatibility, focus, UIA, reboot, and reset.
 Isolation checks two guests' files, clipboard, and credentials.
 Linux mocks do not prove Windows behavior.
+
+`tests/windows-ports.sh ENGINE` checks real TCP responses, multiple mappings,
+offline routing, occupied ports, owner authority, stop/start/reset and revocation.
+It uses a disposable guest, approves a fixture's UAC prompt, and creates only
+narrow test-port firewall rules, removed when the fixture exits.
+
 Process tests need a current helper and check x64/x86 completion
 eviction, forget, deadlines, descendant cleanup and independent timer expiry
 (advancing private timestamps rather than waiting ten minutes).

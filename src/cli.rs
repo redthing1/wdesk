@@ -39,6 +39,9 @@ enum Command {
         cpus: u32,
         #[arg(long)]
         offline: bool,
+        /// Forward host loopback TCP port to a guest port; repeatable
+        #[arg(long, value_name = "HOST_PORT:GUEST_PORT")]
+        forward: Vec<crate::ports::Forward>,
         #[arg(long, default_value_t = 180)]
         timeout: u64,
         #[arg(long)]
@@ -74,6 +77,11 @@ enum Command {
     Share {
         #[command(subcommand)]
         command: Share,
+    },
+    /// Owner-only TCP forwards; change while the VM is stopped
+    Port {
+        #[command(subcommand)]
+        command: Port,
     },
     #[command(hide = true)]
     ShareRelay {
@@ -195,6 +203,8 @@ enum Command {
         bind: String,
         #[arg(long)]
         owner: Option<String>,
+        #[arg(long)]
+        oci: bool,
     },
 }
 
@@ -202,6 +212,12 @@ enum Command {
 enum Clipboard {
     Get,
     Set { text: String },
+}
+#[derive(Subcommand)]
+enum Port {
+    List,
+    Add { forward: crate::ports::Forward },
+    Remove { host_port: u16 },
 }
 #[derive(Subcommand)]
 enum Transfer {
@@ -458,9 +474,12 @@ pub async fn run() -> Result<()> {
         cli.descriptor.is_none()
             || !matches!(
                 cli.command,
-                Command::Share { .. } | Command::Storage | Command::Prune { .. }
+                Command::Share { .. }
+                    | Command::Port { .. }
+                    | Command::Storage
+                    | Command::Prune { .. }
             ),
-        "shares and storage require the local lifecycle owner, not an agent descriptor"
+        "shares, ports and storage require the local lifecycle owner, not an agent descriptor"
     );
     let result = match cli.command {
         Command::Doctor => lifecycle::doctor().await?,
@@ -470,7 +489,8 @@ pub async fn run() -> Result<()> {
             state_dir,
             bind,
             owner: _,
-        } => return crate::runtime::serve(state_dir, bind).await,
+            oci,
+        } => return crate::runtime::serve(state_dir, bind, oci).await,
         Command::ShareRelay { socket } => {
             crate::shares::relay(&socket).await?;
             // Tokio stdin uses an uncancellable blocking read. This short-lived
@@ -483,6 +503,7 @@ pub async fn run() -> Result<()> {
             memory,
             cpus,
             offline,
+            forward,
             timeout,
             no_wait,
         } => {
@@ -494,6 +515,7 @@ pub async fn run() -> Result<()> {
                     memory_mb: memory,
                     cpus,
                     offline,
+                    forwards: forward,
                     ..Default::default()
                 },
             )
@@ -519,6 +541,15 @@ pub async fn run() -> Result<()> {
             }
             Share::Remove { name } => {
                 lifecycle::change_share(&cli.session, &name, None, false).await?
+            }
+        },
+        Command::Port { command } => match command {
+            Port::List => lifecycle::list_ports(&cli.session)?,
+            Port::Add { forward } => {
+                lifecycle::change_port(&cli.session, Some(forward), None).await?
+            }
+            Port::Remove { host_port } => {
+                lifecycle::change_port(&cli.session, None, Some(host_port)).await?
             }
         },
         Command::Reset { timeout, no_wait } => {
@@ -636,7 +667,14 @@ pub async fn run() -> Result<()> {
         command => {
             let client = Client::discover(&cli.session, cli.descriptor.as_deref())?;
             match command {
-                Command::Status => client.get("/v1/health").await?,
+                Command::Status => {
+                    let mut status = client.get("/v1/health").await?;
+                    if cli.descriptor.is_none() {
+                        status["forwards"] =
+                            lifecycle::list_ports(&cli.session)?["forwards"].clone();
+                    }
+                    status
+                }
                 Command::Capabilities => client.get("/v1/capabilities").await?,
                 Command::See { output } => client.screenshot(&output).await?,
                 Command::Click {
@@ -803,6 +841,29 @@ pub async fn run() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn forwards_are_repeatable_and_port_changes_are_explicit() {
+        let cli = Cli::try_parse_from([
+            "wdesk",
+            "open",
+            "--forward",
+            "8080:80",
+            "--forward",
+            "8081:81",
+        ])
+        .unwrap();
+        let Command::Open { forward, .. } = cli.command else {
+            panic!("open expected")
+        };
+        assert_eq!(forward.len(), 2);
+        assert_eq!(forward[1].guest_port, 81);
+        for value in ["0:80", "8080:0", "0.0.0.0:8080:80"] {
+            assert!(Cli::try_parse_from(["wdesk", "open", "--forward", value]).is_err());
+        }
+        assert!(Cli::try_parse_from(["wdesk", "port", "add", "8080:80"]).is_ok());
+        assert!(Cli::try_parse_from(["wdesk", "port", "remove", "8080"]).is_ok());
+    }
 
     #[test]
     fn optional_graphics_has_explicit_architecture_apis_and_windows_arguments() {

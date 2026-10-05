@@ -171,6 +171,7 @@ pub(crate) async fn fetch_limited(
 }
 
 pub async fn open(name: &str, image: &str, engine: &str, config: VmConfig) -> Result<()> {
+    crate::ports::validate(&config.forwards)?;
     let _storage = state::storage_lock(&state::root(), false)?;
     let dir = session_dir(name)?;
     state::private_dir(&dir)?;
@@ -179,6 +180,10 @@ pub async fn open(name: &str, image: &str, engine: &str, config: VmConfig) -> Re
     let session = if owner_path.exists() {
         let session: Session = state::read_json(&owner_path)?;
         ensure!(session.name == name, "session identity mismatch");
+        ensure!(
+            config.forwards.is_empty() || config.forwards == session.config.forwards,
+            "open resumes recorded forwards; stop and use port add/remove to change them"
+        );
         session
     } else {
         ensure!(
@@ -226,6 +231,7 @@ async fn create_overlay(base: &Path, target: &Path) -> Result<()> {
 
 async fn start(dir: &Path, mut session: Session) -> Result<()> {
     crate::shares::validate(&session.config.shares)?;
+    crate::ports::validate(&session.config.forwards)?;
     // Owner state is authoritative; runtime configuration is regenerated so a
     // failed multi-file update cannot silently restore an old share grant.
     state::write_json(&dir.join("vm.json"), &session.config)?;
@@ -234,6 +240,7 @@ async fn start(dir: &Path, mut session: Session) -> Result<()> {
             refresh_descriptor(dir, None, &mut session).await?;
             return Ok(());
         }
+        crate::ports::check_available(&session.config.forwards)?;
         let log = fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -261,8 +268,12 @@ async fn start(dir: &Path, mut session: Session) -> Result<()> {
             .unwrap_or_else(|| format!("wdesk-{}", session.id));
         if container_exists(&session.engine, &container).await? {
             verify_container(&session.engine, &container, &session.id).await?;
+            if !container_running(&session.engine, &container).await? {
+                crate::ports::check_available(&session.config.forwards)?;
+            }
             command(&session.engine, &["start".into(), container.clone()]).await?;
         } else {
+            crate::ports::check_available(&session.config.forwards)?;
             // Base image is mounted at the identical absolute path used by qcow2.
             let images = fs::canonicalize(state::root().join("images"))?;
             let gid = command("stat", &strings(&["-c", "%g", "/dev/kvm"]))
@@ -324,6 +335,9 @@ async fn start(dir: &Path, mut session: Session) -> Result<()> {
                     ),
                 ]);
             }
+            for (index, forward) in session.config.forwards.iter().enumerate() {
+                args.extend(["-p".into(), crate::ports::publication(forward, index)]);
+            }
             args.extend([
                 RUNNER_IMAGE.into(),
                 "serve".into(),
@@ -334,6 +348,9 @@ async fn start(dir: &Path, mut session: Session) -> Result<()> {
                 "--owner".into(),
                 session.id.clone(),
             ]);
+            if !session.config.forwards.is_empty() {
+                args.push("--oci".into());
+            }
             command(&session.engine, &args).await?;
         }
         session.container = Some(container.clone());
@@ -498,6 +515,87 @@ pub fn list_shares(name: &str) -> Result<Value> {
     Ok(json!(load(name)?.config.shares))
 }
 
+pub fn list_ports(name: &str) -> Result<Value> {
+    let session = load(name)?;
+    crate::ports::validate(&session.config.forwards)?;
+    Ok(json!({"forwards":crate::ports::public(&session.config.forwards)}))
+}
+
+pub async fn change_port(
+    name: &str,
+    forward: Option<crate::ports::Forward>,
+    host_port: Option<u16>,
+) -> Result<Value> {
+    let _storage = state::storage_lock(&state::root(), false)?;
+    let dir = session_dir(name)?;
+    let _lock = state::lock(&dir.join("owner.lock"))?;
+    let mut session = load(name)?;
+    ensure_stopped(&dir, &session).await?;
+    if let Some(forward) = forward {
+        session.config.forwards.push(forward);
+    } else {
+        let port = host_port.context("host port required")?;
+        let before = session.config.forwards.len();
+        session
+            .config
+            .forwards
+            .retain(|forward| forward.host_port != port);
+        ensure!(
+            session.config.forwards.len() != before,
+            "host port {port} is not forwarded"
+        );
+    }
+    crate::ports::validate(&session.config.forwards)?;
+    // OCI publications are immutable container configuration. Recreate only
+    // this verified, stopped, owned container on the next open.
+    remove_container(&session).await?;
+    session.container = None;
+    state::write_json(&dir.join("owner.json"), &session)?;
+    Ok(
+        json!({"forwards":crate::ports::public(&session.config.forwards),"next":"open resumes with these forwards"}),
+    )
+}
+
+async fn container_running(engine: &str, container: &str) -> Result<bool> {
+    let running = command(
+        engine,
+        &[
+            "inspect".into(),
+            container.into(),
+            "--format".into(),
+            "{{.State.Running}}".into(),
+        ],
+    )
+    .await?;
+    match running.trim() {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        _ => anyhow::bail!("invalid container running state"),
+    }
+}
+
+async fn ensure_stopped(dir: &Path, session: &Session) -> Result<()> {
+    ensure!(
+        !dir.join("client.json").exists(),
+        "stop this session before changing grants or forwards"
+    );
+    if session.engine == "native" {
+        ensure!(
+            !native_running(dir, &session.id)?,
+            "stop this session first"
+        );
+    } else if let Some(container) = &session.container
+        && container_exists(&session.engine, container).await?
+    {
+        verify_container(&session.engine, container, &session.id).await?;
+        ensure!(
+            !container_running(&session.engine, container).await?,
+            "stop this session first"
+        );
+    }
+    Ok(())
+}
+
 pub async fn change_share(
     name: &str,
     share_name: &str,
@@ -509,31 +607,7 @@ pub async fn change_share(
     let mut session = load(name)?;
     state::validate_name(share_name)?;
     // Revocation must never leave a running server with a stale grant.
-    ensure!(
-        !dir.join("client.json").exists(),
-        "stop this session before changing share grants"
-    );
-    if session.engine == "native" {
-        ensure!(
-            !native_running(&dir, &session.id)?,
-            "stop this session first"
-        );
-    } else if let Some(container) = &session.container
-        && container_exists(&session.engine, container).await?
-    {
-        verify_container(&session.engine, container, &session.id).await?;
-        let running = command(
-            &session.engine,
-            &[
-                "inspect".into(),
-                container.clone(),
-                "--format".into(),
-                "{{.State.Running}}".into(),
-            ],
-        )
-        .await?;
-        ensure!(running.trim() != "true", "stop this session first");
-    }
+    ensure_stopped(&dir, &session).await?;
     if let Some(path) = path {
         ensure!(
             !session

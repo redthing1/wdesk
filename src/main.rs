@@ -3,6 +3,7 @@ mod client;
 mod graphics;
 mod lifecycle;
 mod media;
+mod ports;
 mod protocol;
 mod qmp;
 mod runtime;

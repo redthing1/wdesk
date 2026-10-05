@@ -117,6 +117,8 @@ pub struct VmConfig {
     pub tcg: bool,
     #[serde(default)]
     pub shares: Vec<Share>,
+    #[serde(default)]
+    pub forwards: Vec<crate::ports::Forward>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -140,6 +142,7 @@ impl Default for VmConfig {
             answer_disk: None,
             tcg: false,
             shares: Vec::new(),
+            forwards: Vec::new(),
         }
     }
 }
@@ -170,6 +173,13 @@ pub struct Manifest {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn old_vm_configs_default_to_no_forwards() {
+        let mut value = serde_json::to_value(VmConfig::default()).unwrap();
+        value.as_object_mut().unwrap().remove("forwards");
+        let config: VmConfig = serde_json::from_value(value).unwrap();
+        assert!(config.forwards.is_empty());
+    }
     #[test]
     fn paths_cannot_escape_names() {
         for name in ["../x", "", "a/b", ".", "a,b", "a b"] {

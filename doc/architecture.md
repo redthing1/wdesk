@@ -19,7 +19,11 @@ The builder creates a seed CD and FAT answer-file disk. IDE storage, VGA, USB
 tablet, and COM1 use inbox drivers. QMP and helper sockets stay private to the
 runtime. The helper connects outward through private guestfwd channels; offline mode
 blocks external routing without losing control. Serial is the recovery path.
-No inbound guest ports are forwarded.
+No inbound guest ports are forwarded by default. Owner-configured TCP forwards
+target the VM's DHCP address, never private helper endpoints. Native QEMU binds
+loopback; OCI normalizes bridge peers through bounded in-runtime TCP relays and
+loopback-only engine publications, preserving offline guests' return paths.
+See [networking](networking.md).
 
 Optional live shares use a per-VM unprivileged Samba child. A private Unix socket
 and per-connection guestfwd relay preserve SMB connection lifetimes; no host SMB

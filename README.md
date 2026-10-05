@@ -106,6 +106,9 @@ input share one queue.
 Optional [live shares](doc/shares.md) grant specific host directories; read-only
 is the default. Direct transfers remain independent and need no share service.
 
+Optional [TCP forwarding](doc/networking.md) exposes guest application ports on
+host loopback: `wdesk open --forward 8080:8080`. Nothing is forwarded by default.
+
 ## Develop
 
 See [testing](doc/testing.md) for checks and [architecture](doc/architecture.md)

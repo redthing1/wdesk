@@ -62,7 +62,13 @@ impl InputState {
     }
 }
 
-pub fn vm_args(state_dir: &Path, run_dir: &Path, config: &VmConfig) -> Result<Vec<String>> {
+pub fn vm_args(
+    state_dir: &Path,
+    run_dir: &Path,
+    config: &VmConfig,
+    oci: bool,
+) -> Result<Vec<String>> {
+    crate::ports::validate(&config.forwards)?;
     ensure!(
         (512..=131072).contains(&config.memory_mb) && (1..=64).contains(&config.cpus),
         "invalid VM resources"
@@ -134,6 +140,13 @@ pub fn vm_args(state_dir: &Path, run_dir: &Path, config: &VmConfig) -> Result<Ve
         "-device".into(),
         "e1000e,netdev=net0".into(),
     ];
+    let net = args
+        .iter_mut()
+        .find(|arg| arg.starts_with("user,id=net0,"))
+        .unwrap();
+    for (index, forward) in config.forwards.iter().enumerate() {
+        net.push_str(&crate::ports::qemu_rule(forward, index, oci));
+    }
     if !config.shares.is_empty() {
         ensure!(
             run_dir
@@ -184,7 +197,7 @@ pub fn vm_args(state_dir: &Path, run_dir: &Path, config: &VmConfig) -> Result<Ve
     Ok(args)
 }
 
-pub async fn serve(state_dir: PathBuf, bind: String) -> Result<()> {
+pub async fn serve(state_dir: PathBuf, bind: String, oci: bool) -> Result<()> {
     state::private_dir(&state_dir)?;
     let _lock = state::lock(&state_dir.join("runtime.lock"))?;
     let config: VmConfig = state::read_json(&state_dir.join("vm.json"))?;
@@ -203,7 +216,7 @@ pub async fn serve(state_dir: PathBuf, bind: String) -> Result<()> {
         .append(true)
         .open(state_dir.join("qemu.log"))?;
     let mut qemu = Command::new("qemu-system-x86_64")
-        .args(vm_args(&state_dir, run_dir.path(), &config)?)
+        .args(vm_args(&state_dir, run_dir.path(), &config, oci)?)
         .stdin(std::process::Stdio::null())
         .stdout(qemu_log.try_clone()?)
         .stderr(qemu_log)
@@ -226,6 +239,11 @@ pub async fn serve(state_dir: PathBuf, bind: String) -> Result<()> {
         sleep(Duration::from_millis(100)).await;
     }
     ensure!(started, "QEMU startup deadline exceeded");
+    let mut relays = if oci {
+        Some(crate::ports::Relays::start(&config.forwards).await?)
+    } else {
+        None
+    };
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     let address = listener.local_addr()?;
     let descriptor = Descriptor {
@@ -276,6 +294,10 @@ pub async fn serve(state_dir: PathBuf, bind: String) -> Result<()> {
             Ok(status)=>Err(anyhow::anyhow!("QEMU exited unexpectedly: {status}")),
             Err(error)=>Err(error.into()),
         },
+        result=async {
+            if let Some(relays) = &mut relays { relays.failure().await }
+            else { std::future::pending::<Result<()>>().await }
+        } => result,
         result=async {
             if let Some(shares) = &shares {
                 loop {
@@ -868,6 +890,7 @@ mod tests {
             Path::new("/state"),
             Path::new("/tmp/wdesk-a"),
             &VmConfig::default(),
+            false,
         )
         .unwrap()
         .join(" ");
@@ -880,7 +903,8 @@ mod tests {
             vm_args(
                 Path::new("/state,evil"),
                 Path::new("/tmp/a"),
-                &VmConfig::default()
+                &VmConfig::default(),
+                false
             )
             .is_err()
         );
@@ -890,14 +914,62 @@ mod tests {
             shares: vec![crate::shares::grant("source", dir.path(), true).unwrap()],
             ..Default::default()
         };
-        let shared = vm_args(Path::new("/state"), Path::new("/tmp/wdesk-a"), &config)
-            .unwrap()
-            .join(" ");
+        let shared = vm_args(
+            Path::new("/state"),
+            Path::new("/tmp/wdesk-a"),
+            &config,
+            false,
+        )
+        .unwrap()
+        .join(" ");
         assert!(shared.contains("restrict=on"));
         assert!(shared.contains("guestfwd=tcp:10.0.2.102:445-cmd:/proc/"));
         assert!(!shared.contains("hostfwd"));
         assert!(!shared.contains("smb="));
         assert!(!shared.contains(&dir.path().to_string_lossy().to_string()));
+    }
+
+    #[test]
+    fn application_forwards_preserve_offline_and_private_control_channels() {
+        let config = VmConfig {
+            offline: true,
+            forwards: vec!["8080:80".parse().unwrap(), "9841:8080".parse().unwrap()],
+            ..Default::default()
+        };
+        for oci in [false, true] {
+            let args =
+                vm_args(Path::new("/state"), Path::new("/tmp/wdesk-a"), &config, oci).unwrap();
+            let net = args
+                .iter()
+                .find(|arg| arg.starts_with("user,id=net0,"))
+                .unwrap();
+            assert!(net.contains("restrict=on"));
+            assert!(net.contains("guestfwd=tcp:10.0.2.100:9843-chardev:fast"));
+            assert!(net.contains("guestfwd=tcp:10.0.2.101:9844-chardev:bulk"));
+            assert_eq!(net.matches("hostfwd=").count(), 2);
+            assert!(net.contains(if oci {
+                "hostfwd=tcp:127.0.0.1:20016-10.0.2.15:80"
+            } else {
+                "hostfwd=tcp:127.0.0.1:8080-10.0.2.15:80"
+            }));
+            assert!(!args.iter().any(|arg| arg == "-vnc"));
+        }
+        let invalid = VmConfig {
+            forwards: vec![crate::ports::Forward {
+                host_port: 0,
+                guest_port: 80,
+            }],
+            ..Default::default()
+        };
+        assert!(
+            vm_args(
+                Path::new("/state"),
+                Path::new("/tmp/wdesk-a"),
+                &invalid,
+                false
+            )
+            .is_err()
+        );
     }
 
     #[tokio::test]
